@@ -1,0 +1,348 @@
+From eb2719e2f73b1ba0ef51aeee6aa3442abd01dc5d Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Sat, 28 Feb 2026 12:21:21 +0800
+Subject: [PATCH] Implement yuanrong backend.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../user_guide/feature_guide/kv_pool.md       | 114 ++++++++++++-
+ .../ascend_store/backend/yuanrong_backend.py  | 161 ++++++++++++++++++
+ .../kv_pool/ascend_store/pool_worker.py       |   4 +
+ 3 files changed, 275 insertions(+), 4 deletions(-)
+ create mode 100644 vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+
+diff --git a/docs/source/user_guide/feature_guide/kv_pool.md b/docs/source/user_guide/feature_guide/kv_pool.md
+index 21614f63..4c53238b 100644
+--- a/docs/source/user_guide/feature_guide/kv_pool.md
++++ b/docs/source/user_guide/feature_guide/kv_pool.md
+@@ -14,7 +14,7 @@
+ **kv_connector_extra_config**: Additional Configurable Parameters for Pooling.  
+ **lookup_rpc_port**: Port for RPC Communication Between Pooling Scheduler Process and Worker Process: Each Instance Requires a Unique Port Configuration.  
+ **load_async**: Whether to Enable Asynchronous Loading. The default value is false.  
+-**backend**: Set the storage backend for kvpool, with the default being mooncake.
++**backend**: Set the storage backend for kvpool (`mooncake`, `memcache`, `yuanrong`), with the default being `mooncake`.
+ 
+ ### Environment Variable Configuration
+ 
+@@ -164,7 +164,7 @@ python3 -m vllm.entrypoints.openai.api_server \
+     --port 8100 \
+     --trust-remote-code \
+     --enforce-eager \
+-    --no_enable_prefix_caching \
++    --no-enable-prefix-caching \
+     --tensor-parallel-size 1 \
+     --data-parallel-size 1 \
+     --max-model-len 10000 \
+@@ -229,7 +229,7 @@ python3 -m vllm.entrypoints.openai.api_server \
+     --port 8200 \
+     --trust-remote-code \
+     --enforce-eager \
+-    --no_enable_prefix_caching \
++    --no-enable-prefix-caching \
+     --tensor-parallel-size 1 \
+     --data-parallel-size 1 \
+     --max-model-len 10000 \
+@@ -340,7 +340,7 @@ python3 -m vllm.entrypoints.openai.api_server \
+     --port 8100 \
+     --trust-remote-code \
+     --enforce-eager \
+-    --no_enable_prefix_caching \
++    --no-enable-prefix-caching \
+     --tensor-parallel-size 1 \
+     --data-parallel-size 1 \
+     --max-model-len 10000 \
+@@ -1092,3 +1092,109 @@ python -m vllm.entrypoints.openai.api_server \
+ ```
+ 
+ #### [2.Run Inference](#2run-inference)
++
++## Example of using Yuanrong as a KV Pool backend
++
++* Software:
++    * Install openyuanrong-datasystem on all nodes (yr.datasystem must be importable).
++
++### Install Yuanrong Datasystem
++
++```bash
++pip install openyuanrong-datasystem
++```
++
++### Start etcd
++
++Yuanrong Datasystem requires etcd for service discovery. Start a single-node
++etcd cluster:
++
++```bash
++ETCD_VERSION="v3.5.12"
++ETCD_IP="127.0.0.1"
++if [ "$(uname -m)" = "aarch64" ]; then
++  ETCD_ARCH="linux-arm64"
++else
++  ETCD_ARCH="linux-amd64"
++fi
++wget https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-${ETCD_ARCH}.tar.gz
++tar -xvf etcd-${ETCD_VERSION}-${ETCD_ARCH}.tar.gz
++cd etcd-${ETCD_VERSION}-${ETCD_ARCH}
++sudo cp etcd etcdctl /usr/local/bin/
++
++etcd \
++  --name etcd-single \
++  --data-dir /tmp/etcd-data \
++  --listen-client-urls http://0.0.0.0:2379 \
++  --advertise-client-urls http://${ETCD_IP}:2379 \
++  --listen-peer-urls http://0.0.0.0:2380 \
++  --initial-advertise-peer-urls http://${ETCD_IP}:2380 \
++  --initial-cluster etcd-single=http://${ETCD_IP}:2380 &
++
++etcdctl --endpoints "${ETCD_IP}:2379" put key "value"
++etcdctl --endpoints "${ETCD_IP}:2379" get key
++```
++
++For production environments, refer to the official etcd clustering
++documentation: <https://etcd.io/docs/current/op-guide/clustering/>
++
++### Start Datasystem Worker
++
++Start a Datasystem worker on each node using dscli:
++
++```bash
++dscli start -w \
++  --worker_address "${WORKER_IP}:31501" \
++  --etcd_address "${ETCD_IP}:2379" \
++  --shared_memory_size_mb 20480
++```
++
++For more parameters, refer to the `dscli` usage documentation on the Yuanrong Datasystem official site:
++<https://atomgit.com/openeuler/yuanrong-datasystem>
++
++To stop the worker:
++
++```bash
++dscli stop --worker_address "${WORKER_IP}:31501"
++```
++
++### Environment Variable Configuration
++
++Set the worker address on each node. The value must match the
++`dscli start --worker_address` address on the same host.
++
++```bash
++export PYTHONHASHSEED=0
++# Required: must match local dscli --worker_address
++export DS_WORKER_ADDR="${WORKER_IP}:31501"
++# Optional (default: 0)
++export DS_ENABLE_EXCLUSIVE_CONNECTION=0
++export DS_ENABLE_REMOTE_H2D=0
++```
++
++### Run AscendStoreConnector with Yuanrong backend
++
++```bash
++python3 -m vllm.entrypoints.openai.api_server \
++    --model /xxxxx/Qwen2.5-7B-Instruct \
++    --port 8100 \
++    --trust-remote-code \
++    --enforce-eager \
++    --no-enable-prefix-caching \
++    --tensor-parallel-size 1 \
++    --data-parallel-size 1 \
++    --max-model-len 10000 \
++    --block-size 128 \
++    --max-num-batched-tokens 4096 \
++    --kv-transfer-config \
++    '{
++    "kv_connector": "AscendStoreConnector",
++    "kv_role": "kv_both",
++    "kv_connector_extra_config": {
++        "lookup_rpc_port": "1",
++        "backend": "yuanrong"
++    }
++}'
++```
++
++#### [2.Run Inference](#2run-inference)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+new file mode 100644
+index 00000000..74d7ff48
+--- /dev/null
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+@@ -0,0 +1,161 @@
++import hashlib
++import os
++import re
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++from vllm.config import ParallelConfig
++from vllm.logger import logger
++from vllm.utils.network_utils import split_host_port
++
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
++
++
++@dataclass
++class YuanrongConfig:
++    worker_addr: str
++    enable_exclusive_connection: bool
++    enable_remote_h2d: bool
++
++    @staticmethod
++    def load_from_env() -> "YuanrongConfig":
++        worker_addr = os.getenv("DS_WORKER_ADDR")
++        if not worker_addr:
++            raise ValueError("Environment variable DS_WORKER_ADDR is required, expected format '<host>:<port>'.")
++
++        return YuanrongConfig(
++            worker_addr=worker_addr,
++            enable_exclusive_connection=bool(int(os.getenv("DS_ENABLE_EXCLUSIVE_CONNECTION", "0"))),
++            enable_remote_h2d=bool(int(os.getenv("DS_ENABLE_REMOTE_H2D", "0"))),
++        )
++
++
++class YuanrongHelper:
++    _DS_KEY_MAX_LEN = 255
++    _DS_KEY_ALLOWED_PATTERN = re.compile(r"^[a-zA-Z0-9\-_!@#%\^\*\(\)\+\=\:;]+$")
++    _DS_KEY_INVALID_CHAR_PATTERN = re.compile(r"[^a-zA-Z0-9\-_!@#%\^\*\(\)\+\=\:;]")
++    _DS_KEY_HASH_SUFFIX_LEN = 16
++
++    def __init__(self, blob_cls, blob_list_cls):
++        self._blob_cls = blob_cls
++        self._blob_list_cls = blob_list_cls
++        self._device_id: int | None = None
++
++    def normalize_keys(self, keys: list[str]) -> list[str]:
++        normalized: list[str] = []
++        for key in keys:
++            if len(key) <= self._DS_KEY_MAX_LEN and self._DS_KEY_ALLOWED_PATTERN.match(key):
++                normalized.append(key)
++                continue
++
++            sanitized = self._DS_KEY_INVALID_CHAR_PATTERN.sub("_", key)
++            hash_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
++            suffix = f"__{hash_digest[: self._DS_KEY_HASH_SUFFIX_LEN]}"
++            max_prefix_len = self._DS_KEY_MAX_LEN - len(suffix)
++            normalized.append(sanitized[:max_prefix_len] + suffix)
++        return normalized
++
++    def make_blob_lists(self, addrs_list: list[list[int]], sizes_list: list[list[int]]) -> list[Any]:
++        total = len(addrs_list)
++        if total != len(sizes_list):
++            raise ValueError("Address list and size list length mismatch.")
++
++        device_id = self._device_id
++        if device_id is None:
++            logger.error("Device id is not set. Call set_device() before using the yuanrong backend.")
++            raise RuntimeError("Yuanrong backend device id is not initialized.")
++
++        blob_lists: list[Any] = []
++        for addrs, sizes in zip(addrs_list, sizes_list):
++            if len(addrs) != len(sizes):
++                raise ValueError("Address list and size list length mismatch.")
++            blobs = [
++                self._blob_cls(addr, size)  # type: ignore[misc]
++                for addr, size in zip(addrs, sizes)
++            ]
++            blob_lists.append(
++                self._blob_list_cls(device_id, blobs)  # type: ignore[misc]
++            )
++        return blob_lists
++
++
++class YuanrongBackend(Backend):
++    def __init__(self, parallel_config: ParallelConfig):
++        try:
++            from yr.datasystem.hetero_client import Blob, DeviceBlobList, HeteroClient  # type: ignore[import-not-found]
++            from yr.datasystem.kv_client import SetParam  # type: ignore[import-not-found]
++            from yr.datasystem.object_client import WriteMode  # type: ignore[import-not-found]
++        except ImportError as exc:
++            raise ImportError("Please install openyuanrong-datasystem to use the yuanrong backend.") from exc
++
++        self.rank = parallel_config.rank
++        self._helper = YuanrongHelper(Blob, DeviceBlobList)
++        self._ds_set_param = SetParam()
++        self._ds_set_param.write_mode = WriteMode.NONE_L2_CACHE_EVICT
++
++        self.config = YuanrongConfig.load_from_env()
++        try:
++            host, port = split_host_port(self.config.worker_addr)
++        except Exception as exc:
++            raise ValueError(f"Invalid DS_WORKER_ADDR '{self.config.worker_addr}', expected '<host>:<port>'.") from exc
++        self._hetero_client = HeteroClient(
++            host,
++            int(port),
++            enable_exclusive_connection=self.config.enable_exclusive_connection,
++            enable_remote_h2d=self.config.enable_remote_h2d,
++        )
++        self._hetero_client.init()
++
++    def _ensure_device_ready(self):
++        if self._helper._device_id is None:
++            self.set_device()
++
++    def set_device(self):
++        device = torch.device(f"npu:{self.rank}")
++        torch.npu.set_device(device)
++        self._helper._device_id = int(torch.npu.current_device())
++
++    def register_buffer(self, ptrs: list[int], lengths: list[int]):
++        # Yuanrong APIs consume device pointers directly when building blob
++        # lists. No explicit pre-registration is required.
++        self._ensure_device_ready()
++
++    def exists(self, keys: list[str]) -> list[int]:
++        if len(keys) == 0:
++            return []
++        try:
++            keys = self._helper.normalize_keys(keys)
++            exists = self._hetero_client.exist(keys)  # type: ignore[union-attr]
++            return [1 if value else 0 for value in exists]
++        except Exception as exc:
++            logger.error("Failed to check keys %s: %s", keys, exc)
++            return [0] * len(keys)
++
++    def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
++        if len(keys) == 0:
++            return
++        try:
++            self._ensure_device_ready()
++            keys = self._helper.normalize_keys(keys)
++            blob_lists = self._helper.make_blob_lists(addrs, sizes)
++            failed_keys = self._hetero_client.mget_h2d(  # type: ignore[union-attr]
++                keys, blob_lists, 0
++            )
++            for key in failed_keys:
++                logger.error("Failed to get key %s", key)
++        except Exception as exc:
++            logger.error("Failed to get keys %s: %s", keys, exc)
++
++    def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
++        if len(keys) == 0:
++            return
++        try:
++            self._ensure_device_ready()
++            keys = self._helper.normalize_keys(keys)
++            blob_lists = self._helper.make_blob_lists(addrs, sizes)
++            self._hetero_client.mset_d2h(  # type: ignore[union-attr]
++                keys, blob_lists, self._ds_set_param
++            )
++        except Exception as exc:
++            logger.error("Failed to put keys %s: %s", keys, exc)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index 4e6cb0a5..0539a353 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -40,6 +40,10 @@ backend_map = {
+         "name": "MemcacheBackend",
+         "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend",
+     },
++    "yuanrong": {
++        "name": "YuanrongBackend",
++        "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend",
++    },
+ }
+ 
+ 
+-- 
+2.51.0.windows.1
+
