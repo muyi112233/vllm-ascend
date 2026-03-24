@@ -21,7 +21,6 @@ import numpy.typing as npt
 import torch
 import torch_npu
 import zmq
-from mooncake.engine import TransferEngine  # type: ignore
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
@@ -38,10 +37,11 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    get_world_group,
 )
 from vllm.distributed.utils import get_pp_indices
 from vllm.logger import logger
-from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
+from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket, split_host_port
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import RequestStatus
@@ -62,6 +62,8 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+YUANRONG_BACKEND = "yuanrong"
+YUANRONG_KEY_PREFIX = "pd"
 
 
 class RemotePortInfo(TypedDict):
@@ -91,6 +93,82 @@ class ReqMeta:
     remote_ptp_size: int | None
     remote_multi_nodes_meta_mapping: dict[str, dict[str, Any]]
     num_prompt_blocks: int
+
+
+@dataclass
+class SendReqMeta:
+    delay_start_time: float
+    block_ids: list[int]
+
+
+class YuanrongTransferClient:
+    _MAX_BATCH_KEYS = 10000
+
+    def __init__(self):
+        try:
+            from yr.datasystem.hetero_client import Blob, DeviceBlobList, HeteroClient  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "Please install openyuanrong-datasystem to use the Yuanrong-backed MooncakeConnector."
+            ) from exc
+
+        worker_addr = os.getenv("DS_WORKER_ADDR")
+        if not worker_addr:
+            raise ValueError("Environment variable DS_WORKER_ADDR is required when transfer_backend is 'yuanrong'.")
+
+        host, port = split_host_port(worker_addr)
+        self._blob_cls = Blob
+        self._blob_list_cls = DeviceBlobList
+        self._device_id = int(torch.npu.current_device())
+        self._hetero_client = HeteroClient(
+            host,
+            int(port),
+            enable_exclusive_connection=bool(int(os.getenv("DS_ENABLE_EXCLUSIVE_CONNECTION", "0"))),
+            enable_remote_h2d=bool(int(os.getenv("DS_ENABLE_REMOTE_H2D", "0"))),
+        )
+        self._hetero_client.init()
+
+    def make_blob_list(self, addrs: list[int], sizes: list[int]) -> Any:
+        if len(addrs) != len(sizes):
+            raise ValueError("Address list and size list length mismatch.")
+        blobs = [self._blob_cls(addr, size) for addr, size in zip(addrs, sizes)]
+        return self._blob_list_cls(self._device_id, blobs)
+
+    def dev_mset(self, keys: list[str], addrs_list: list[list[int]], sizes_list: list[list[int]]) -> list[str]:
+        failed_keys: list[str] = []
+        for start in range(0, len(keys), self._MAX_BATCH_KEYS):
+            end = start + self._MAX_BATCH_KEYS
+            blob_lists = [
+                self.make_blob_list(addrs, sizes)
+                for addrs, sizes in zip(addrs_list[start:end], sizes_list[start:end])
+            ]
+            failed_keys.extend(self._hetero_client.dev_mset(keys[start:end], blob_lists))
+        return failed_keys
+
+    def dev_mget(
+        self, keys: list[str], addrs_list: list[list[int]], sizes_list: list[list[int]], sub_timeout_ms: int
+    ) -> list[str]:
+        failed_keys: list[str] = []
+        for start in range(0, len(keys), self._MAX_BATCH_KEYS):
+            end = start + self._MAX_BATCH_KEYS
+            blob_lists = [
+                self.make_blob_list(addrs, sizes)
+                for addrs, sizes in zip(addrs_list[start:end], sizes_list[start:end])
+            ]
+            failed_keys.extend(self._hetero_client.dev_mget(keys[start:end], blob_lists, sub_timeout_ms))
+        return failed_keys
+
+    def dev_delete(self, keys: list[str]) -> list[str]:
+        failed_keys: list[str] = []
+        for start in range(0, len(keys), self._MAX_BATCH_KEYS):
+            end = start + self._MAX_BATCH_KEYS
+            failed_keys.extend(self._hetero_client.dev_delete(keys[start:end]))
+        return failed_keys
+
+
+def build_yuanrong_key(engine_id: str, request_id: str, handshake_port: int, block_id: int) -> str:
+    request_hash = hashlib.sha1(request_id.encode("utf-8")).hexdigest()[:16]
+    return f"{YUANRONG_KEY_PREFIX}:{engine_id}:{request_hash}:{handshake_port}:{block_id}"
 
 
 @dataclass
@@ -305,7 +383,7 @@ class KVCacheRecvingThread(threading.Thread):
         tp_rank: int,
         tp_size: int,
         _prefill_pp_size: int,
-        engine: TransferEngine,
+        engine: Any,
         local_engine_id: str,
         local_handshake_port: int,
         side_channel_port: int,
@@ -411,8 +489,12 @@ class KVCacheRecvingThread(threading.Thread):
         """
         return self.task_tracker.get_and_clear_finished_requests()
 
+    def _initialize_thread_context(self) -> None:
+        """Initialize any thread-local runtime state before processing."""
+
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
+        self._initialize_thread_context()
         self.ready_event.set()
         while True:
             try:
@@ -778,10 +860,112 @@ class KVCacheRecvingThread(threading.Thread):
             self.remote_sockets[remote_path].append(sock)
 
 
+class YuanrongKVCacheRecvingThread(KVCacheRecvingThread):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.yuanrong_client: YuanrongTransferClient | None = None
+
+    def _initialize_thread_context(self) -> None:
+        local_rank = get_world_group().local_rank
+        device = torch.device(f"npu:{local_rank}")
+        torch.npu.set_device(device)
+        self.yuanrong_client = YuanrongTransferClient()
+
+    def _get_yuanrong_client(self) -> YuanrongTransferClient:
+        if self.yuanrong_client is None:
+            raise RuntimeError("Yuanrong transfer client is not initialized in the receiving thread.")
+        return self.yuanrong_client
+
+    def _get_local_layer_base_addrs(self, prefill_pp_rank: int) -> list[int]:
+        first_layer_index, end_layer_index = self.pp_layer_indices[prefill_pp_rank]
+        num_cache_per_layer = len(list(self.kv_caches.values())[0])
+        return self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port][
+            first_layer_index * num_cache_per_layer : end_layer_index * num_cache_per_layer
+        ]
+
+    def _build_local_block_blob_desc(
+        self,
+        block_id: int,
+        offset: int,
+        tp_num_need_pulls: int,
+    ) -> tuple[list[int], list[int]]:
+        prefill_pp_rank = offset // tp_num_need_pulls
+        inner_offset = offset % tp_num_need_pulls
+        layer_base_addrs = self._get_local_layer_base_addrs(prefill_pp_rank)
+        addrs: list[int] = []
+        sizes: list[int] = []
+        block_length = len(self.block_len)
+        for idx, base_addr in enumerate(layer_base_addrs):
+            full_block_len = self.block_len[idx % block_length]
+            slice_len = full_block_len // tp_num_need_pulls
+            addrs.append(base_addr + block_id * full_block_len + inner_offset * slice_len)
+            sizes.append(slice_len)
+        return addrs, sizes
+
+    def _transfer_kv_cache(self, req_meta: dict[str, Any]):
+        remote_request_id = req_meta["remote_request_id"]
+        remote_block_ids = req_meta["remote_block_ids"]
+        local_block_ids = req_meta["local_block_ids"]
+        remote_engine_id = req_meta["remote_engine_id"]
+        remote_handshake_port = req_meta["remote_handshake_port"]
+        offset = req_meta["offset"]
+        tp_num_need_pulls = req_meta["tp_num_need_pulls"]
+
+        num_local_blocks = len(local_block_ids)
+        if num_local_blocks == 0:
+            return
+
+        num_remote_blocks = len(remote_block_ids)
+        assert num_local_blocks <= num_remote_blocks
+        if num_local_blocks < num_remote_blocks:
+            remote_block_ids = remote_block_ids[-num_local_blocks:]
+
+        req_start_time = time.perf_counter()
+        keys: list[str] = []
+        addrs_list: list[list[int]] = []
+        sizes_list: list[list[int]] = []
+        for remote_block_id, local_block_id in zip(remote_block_ids, local_block_ids):
+            keys.append(build_yuanrong_key(remote_engine_id, remote_request_id, remote_handshake_port, remote_block_id))
+            addrs, sizes = self._build_local_block_blob_desc(local_block_id, offset, tp_num_need_pulls)
+            addrs_list.append(addrs)
+            sizes_list.append(sizes)
+
+        failed_keys = self._get_yuanrong_client().dev_mget(keys, addrs_list, sizes_list, sub_timeout_ms=0)
+        if failed_keys:
+            logger.error("Yuanrong transfer failed for request %s, keys=%s", remote_request_id, failed_keys)
+            raise RuntimeError(f"Yuanrong transfer failed for request {remote_request_id}")
+
+        req_end_time = time.perf_counter()
+        req_transfer_elapsed = (req_end_time - req_start_time) * 1000
+        logger.info(
+            "KV cache transfer for request %s took %.2f ms (%d blocks). local_ip %s local_device_id %s remote_port %s",
+            remote_request_id,
+            req_transfer_elapsed,
+            len(local_block_ids),
+            get_ip(),
+            self.tp_rank,
+            remote_handshake_port,
+        )
+
+        is_kv_transfer_end = offset == tp_num_need_pulls * self._prefill_pp_size - 1
+        need_cat_cache = tp_num_need_pulls > 1 and is_kv_transfer_end
+        need_nz_cache = get_ascend_config().enable_kv_nz and is_kv_transfer_end
+        use_fused_op = ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK
+        grouped_local_block_ids = [[block_id] for block_id in local_block_ids]
+        if need_nz_cache or need_cat_cache:
+            if use_fused_op and enable_custom_op():
+                if need_cat_cache:
+                    self.reformat_kv_cache_with_fused_op(grouped_local_block_ids, tp_num_need_pulls)
+                if need_nz_cache:
+                    self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, False, need_nz_cache)
+            else:
+                self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, need_cat_cache, need_nz_cache)
+
+
 class MooncakeConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.requests: dict[str, ReqMeta] = {}
-        self.requests_to_send: dict[str, float] = {}
+        self.requests_to_send: dict[str, SendReqMeta] = {}
         self.reqs_in_batch: set[str] = set()
 
     def add_new_req(
@@ -939,7 +1123,7 @@ class MooncakeConnectorScheduler:
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int], int]] = {}
-        self._reqs_need_send: dict[str, float] = {}
+        self._reqs_need_send: dict[str, SendReqMeta] = {}
         self._reqs_in_batch: set[str] = set()
 
         # master-slave meta information for cross-nodes
@@ -1055,7 +1239,10 @@ class MooncakeConnectorScheduler:
         delay_free_blocks = len(computed_block_ids) > 0
         if delay_free_blocks:
             logger.info("Delaying free of %d blocks for request %s", len(computed_block_ids), request.request_id)
-            self._reqs_need_send[request.request_id] = time.time()
+            self._reqs_need_send[request.request_id] = SendReqMeta(
+                delay_start_time=time.time(),
+                block_ids=computed_block_ids,
+            )
 
         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
 
@@ -1094,6 +1281,7 @@ class MooncakeConnectorWorker:
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
         self._get_prefill_decode_size(vllm_config)
+        self.transfer_backend = vllm_config.kv_transfer_config.get_from_extra_config("transfer_backend", "mooncake")
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
         if self._prefill_tp_size < self._decode_tp_size:
             raise ValueError(
@@ -1136,12 +1324,19 @@ class MooncakeConnectorWorker:
         device_index = (self.pp_rank + self.pcp_rank) * self.tp_size + self.tp_rank
         self.handshake_port = self.side_channel_port + device_index
         self.sockets: dict = {}
-        self.engine = global_te.get_transfer_engine(self.side_channel_host, device_name=None)
-        self.te_rpc_port = self.engine.get_rpc_port()
+        self.engine = None
+        self.te_rpc_port = 0
+        if self.transfer_backend != YUANRONG_BACKEND:
+            self.engine = global_te.get_transfer_engine(self.side_channel_host, device_name=None)
+            self.te_rpc_port = self.engine.get_rpc_port()
 
         # Background thread for sending or receiving KV caches.
         self.kv_send_thread: KVCacheSendingThread | None = None
         self.kv_recv_thread: KVCacheRecvingThread | None = None
+        self._yuanrong_client: YuanrongTransferClient | None = None
+        self._yuanrong_published_keys: dict[str, list[str]] = {}
+        self.local_kv_caches_base_addr: list[int] = []
+        self.num_cache_per_layer = 0
 
         # Handshake metadata of this worker
         self.xfer_handshake_metadata: MooncakeAgentMetadata | None = None
@@ -1179,6 +1374,66 @@ class MooncakeConnectorWorker:
         self._decode_pp_size = decode_parallel_config.get("pp_size", 1)
         assert self._decode_pp_size == 1, "decode pp size must be 1"
         self._prefill_pp_layer_partition = prefill_parallel_config.get("pp_layer_partition")
+
+    def _is_yuanrong_backend(self) -> bool:
+        return self.transfer_backend == YUANRONG_BACKEND
+
+    def _ensure_yuanrong_client(self) -> YuanrongTransferClient:
+        if self._yuanrong_client is None:
+            self._yuanrong_client = YuanrongTransferClient()
+        return self._yuanrong_client
+
+    def _get_layer_base_addrs_for_pp_rank(self, pp_rank: int) -> list[int]:
+        first_layer_index, end_layer_index = get_prefill_pp_indices(
+            self.vllm_config.model_config.hf_text_config.num_hidden_layers,
+            pp_rank,
+            self._prefill_pp_size,
+            self._prefill_pp_layer_partition,
+        )
+        return self.local_kv_caches_base_addr[
+            first_layer_index * self.num_cache_per_layer : end_layer_index * self.num_cache_per_layer
+        ]
+
+    def _build_publish_block_blob_desc(self, block_id: int) -> tuple[list[int], list[int]]:
+        layer_base_addrs = self._get_layer_base_addrs_for_pp_rank(self.pp_rank)
+        addrs: list[int] = []
+        sizes: list[int] = []
+        block_length = len(self.block_len)
+        for idx, base_addr in enumerate(layer_base_addrs):
+            block_len = self.block_len[idx % block_length]
+            addrs.append(base_addr + block_id * block_len)
+            sizes.append(block_len)
+        return addrs, sizes
+
+    def _publish_request_blocks(self, request_id: str, block_ids: list[int]) -> None:
+        if not block_ids:
+            return
+        client = self._ensure_yuanrong_client()
+        keys: list[str] = []
+        addrs_list: list[list[int]] = []
+        sizes_list: list[list[int]] = []
+        for block_id in block_ids:
+            keys.append(build_yuanrong_key(self.engine_id, request_id, self.handshake_port, block_id))
+            addrs, sizes = self._build_publish_block_blob_desc(block_id)
+            addrs_list.append(addrs)
+            sizes_list.append(sizes)
+
+        failed_keys = client.dev_mset(keys, addrs_list, sizes_list)
+        if failed_keys:
+            raise RuntimeError(f"Failed to publish Yuanrong keys for request {request_id}: {failed_keys}")
+        self._yuanrong_published_keys[request_id] = keys
+
+    def _cleanup_published_request_keys(self, request_ids: set[str]) -> None:
+        if not self._is_yuanrong_backend() or not request_ids:
+            return
+        client = self._ensure_yuanrong_client()
+        for request_id in request_ids:
+            keys = self._yuanrong_published_keys.pop(request_id, [])
+            if not keys:
+                continue
+            failed_keys = client.dev_delete(keys)
+            if failed_keys:
+                logger.warning("Failed to delete Yuanrong keys for request %s: %s", request_id, failed_keys)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""
@@ -1222,6 +1477,7 @@ class MooncakeConnectorWorker:
         ptrs = []
         lengths = []
         length = len(self.block_len)
+        self.num_cache_per_layer = len(list(kv_caches.values())[0])
         for cache_or_caches in kv_caches.values():
             # Normalize to always be a list of caches
             for i, cache in enumerate(cache_or_caches, 0):
@@ -1230,7 +1486,11 @@ class MooncakeConnectorWorker:
                 kv_caches_base_addr.append(base_addr)
                 ptrs.append(base_addr)
                 lengths.append(region_len)
-        global_te.register_buffer(ptrs, lengths)
+        self.local_kv_caches_base_addr = kv_caches_base_addr
+        if self._is_yuanrong_backend() and self.kv_role == "kv_producer":
+            self._ensure_yuanrong_client()
+        elif not self._is_yuanrong_backend():
+            global_te.register_buffer(ptrs, lengths)
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
             engine_id=self.engine_id,
@@ -1257,7 +1517,8 @@ class MooncakeConnectorWorker:
             )
             self.kv_send_thread.start()
         else:
-            self.kv_recv_thread = KVCacheRecvingThread(
+            recv_thread_cls = YuanrongKVCacheRecvingThread if self._is_yuanrong_backend() else KVCacheRecvingThread
+            self.kv_recv_thread = recv_thread_cls(
                 self.tp_rank,
                 self.tp_size,
                 self._prefill_pp_size,
@@ -1291,6 +1552,7 @@ class MooncakeConnectorWorker:
             if self.kv_role == "kv_producer"
             else set()
         )
+        self._cleanup_published_request_keys(done_sending)
         done_recving = (
             self.kv_recv_thread.get_and_clear_finished_requests(  # type: ignore[union-attr]
             )
@@ -1594,15 +1856,19 @@ class MooncakeConnectorWorker:
                 self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:
-            for req_id, delay_start_time in metadata.requests_to_send.items():
+            for req_id, send_meta in metadata.requests_to_send.items():
                 if self.tp_rank in self._prefill_get_remote_rank(req_id):
-                    self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
+                    if self._is_yuanrong_backend():
+                        self._publish_request_blocks(req_id, send_meta.block_ids)
+                    self.kv_send_thread.add_delayed_request(req_id, send_meta.delay_start_time)
                 else:
                     self.kv_send_thread.add_not_transfer_request(req_id)
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size > 1:
-            for req_id, delay_start_time in metadata.requests_to_send.items():
-                self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
+            for req_id, send_meta in metadata.requests_to_send.items():
+                if self._is_yuanrong_backend():
+                    self._publish_request_blocks(req_id, send_meta.block_ids)
+                self.kv_send_thread.add_delayed_request(req_id, send_meta.delay_start_time)
 
     def _get_tp_num_need_pulls(self, prefill_tp_size: int) -> int:
         if prefill_tp_size is None:
