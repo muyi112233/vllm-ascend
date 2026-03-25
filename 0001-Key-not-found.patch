@@ -1,0 +1,124 @@
+From 213ccf72ad55a9c90657a029004269436634b9ea Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Wed, 25 Mar 2026 11:01:39 +0800
+Subject: [PATCH] Key not found
+
+---
+ .../kv_transfer/kv_p2p/mooncake_connector.py  | 44 +++++++++++++++++--
+ 1 file changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+index 54d17ba7..46665b24 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -197,6 +197,7 @@ class KVCacheTaskTracker:
+ 
+         self.done_task_lock = threading.Lock()
+         self.finished_requests: set[str] = set()
++        self.load_error_block_ids: set[int] = set()
+         # Only used in prefill node. Tracks requests whose kv blocks freeing is
+         # intentionally delayed. Each entry is a tuple of (request_id,
+         # timestamp). If a request remains in this queue for too long, it will
+@@ -237,6 +238,20 @@ class KVCacheTaskTracker:
+             self.finished_requests.clear()
+         return finished_requests
+ 
++    def update_load_error_block_ids(self, block_ids: list[int]) -> None:
++        """Record local blocks that failed to load from a remote worker."""
++        if not block_ids:
++            return
++        with self.done_task_lock:
++            self.load_error_block_ids.update(block_ids)
++
++    def get_and_clear_load_error_block_ids(self) -> set[int]:
++        """Get and clear local blocks that failed to load."""
++        with self.done_task_lock:
++            load_error_block_ids = self.load_error_block_ids.copy()
++            self.load_error_block_ids.clear()
++        return load_error_block_ids
++
+     def add_delayed_request(self, request_id: str, delay_start_time: float):
+         """Add a delayed free request."""
+         with self.done_task_lock:
+@@ -489,6 +504,10 @@ class KVCacheRecvingThread(threading.Thread):
+         """
+         return self.task_tracker.get_and_clear_finished_requests()
+ 
++    def get_and_clear_load_error_block_ids(self) -> set[int]:
++        """Get and clear local blocks that failed to load."""
++        return self.task_tracker.get_and_clear_load_error_block_ids()
++
+     def _initialize_thread_context(self) -> None:
+         """Initialize any thread-local runtime state before processing."""
+ 
+@@ -514,15 +533,19 @@ class KVCacheRecvingThread(threading.Thread):
+         remote_handshake_port = req_meta["remote_handshake_port"]
+         remote_port_send_num = req_meta["remote_port_send_num"]
+         all_task_done = req_meta["all_task_done"]
++        transfer_succeeded = False
+ 
+         try:
+             logger.debug(f"Starting to transfer KV cache for request {remote_request_id}.")
+             self._transfer_kv_cache(req_meta)
+             logger.debug(f"Finished transferring KV cache for request {remote_request_id}.")
++            transfer_succeeded = True
+         except Exception as e:
++            self.task_tracker.update_load_error_block_ids(req_meta.get("local_block_ids", []))
+             logger.error(f"Failed to transfer KV cache for request {remote_request_id}: {e}", exc_info=True)
+         finally:
+-            self._send_done_signal_to_free_remote_port(remote_request_id, remote_host, remote_port_send_num)
++            if transfer_succeeded:
++                self._send_done_signal_to_free_remote_port(remote_request_id, remote_host, remote_port_send_num)
+             if all_task_done:
+                 self.task_tracker.update_done_task_count(request_id)
+                 if request_id in self.proc_not_transfer_request:
+@@ -531,7 +554,10 @@ class KVCacheRecvingThread(threading.Thread):
+             # Always send the done signal to the remote host to ensure proper
+             # resource cleanup. Failing to do so may cause a memory leak on the
+             # remote host.
+-            self._send_done_recv_signal(remote_request_id, remote_host, remote_handshake_port, remote_port_send_num)
++            if transfer_succeeded:
++                self._send_done_recv_signal(
++                    remote_request_id, remote_host, remote_handshake_port, remote_port_send_num
++                )
+ 
+     def _send_done_signal_to_free_remote_port(
+         self, request_id: str, remote_host: str, remote_port_send_num: dict[int, RemotePortInfo]
+@@ -930,7 +956,10 @@ class YuanrongKVCacheRecvingThread(KVCacheRecvingThread):
+             addrs_list.append(addrs)
+             sizes_list.append(sizes)
+ 
+-        failed_keys = self._get_yuanrong_client().dev_mget(keys, addrs_list, sizes_list, sub_timeout_ms=0)
++        sub_timeout_ms = min(get_transfer_timeout_value(), 1000)
++        failed_keys = self._get_yuanrong_client().dev_mget(
++            keys, addrs_list, sizes_list, sub_timeout_ms=sub_timeout_ms
++        )
+         if failed_keys:
+             logger.error("Yuanrong transfer failed for request %s, keys=%s", remote_request_id, failed_keys)
+             raise RuntimeError(f"Yuanrong transfer failed for request {remote_request_id}")
+@@ -1045,6 +1074,10 @@ class MooncakeConnector(KVConnectorBase_V1):
+         assert self.connector_worker is not None
+         return self.connector_worker.get_finished()
+ 
++    def get_block_ids_with_load_errors(self) -> set[int]:
++        assert self.connector_worker is not None
++        return self.connector_worker.get_block_ids_with_load_errors()
++
+     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+         assert self.connector_worker is not None
+         assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
+@@ -1567,6 +1600,11 @@ class MooncakeConnectorWorker:
+             )
+         return done_sending, done_recving
+ 
++    def get_block_ids_with_load_errors(self) -> set[int]:
++        if self.kv_role != "kv_consumer" or self.kv_recv_thread is None:
++            return set()
++        return self.kv_recv_thread.get_and_clear_load_error_block_ids()
++
+     def _get_kv_split_metadata(
+         self,
+         req_id: str,
+-- 
+2.51.0.windows.1
+
