@@ -49,6 +49,12 @@ def register_connector():
     )
 
     KVConnectorFactory.register_connector(
+        "YuanrongConnector",
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.yuanrong_connector",
+        "YuanrongConnector",
+    )
+
+    KVConnectorFactory.register_connector(
         "UCMConnector", "vllm_ascend.distributed.kv_transfer.kv_pool.ucm_connector", "UCMConnectorV1"
     )
 

@@ -21,7 +21,6 @@ import numpy.typing as npt
 import torch
 import torch_npu
 import zmq
-from mooncake.engine import TransferEngine  # type: ignore
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
@@ -54,6 +53,7 @@ from vllm_ascend.utils import enable_custom_op, is_vl_model
 
 # isort: off
 if TYPE_CHECKING:
+    from mooncake.engine import TransferEngine as MooncakeTransferEngine  # type: ignore
     from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -305,7 +305,7 @@ class KVCacheRecvingThread(threading.Thread):
         tp_rank: int,
         tp_size: int,
         _prefill_pp_size: int,
-        engine: TransferEngine,
+        engine: Any,
         local_engine_id: str,
         local_handshake_port: int,
         side_channel_port: int,
@@ -325,6 +325,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.side_channel_port = side_channel_port
         self.engine = engine
         self.ready_event = ready_event
+        self.device = torch.device(f"npu:{int(torch.npu.current_device())}")
 
         self.kv_caches = kv_caches
         self.kv_caches_base_addr: dict[str, dict[int, list[int]]] = SizedDict()
@@ -413,6 +414,7 @@ class KVCacheRecvingThread(threading.Thread):
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
+        torch.npu.set_device(self.device)
         self.ready_event.set()
         while True:
             try:
@@ -812,16 +814,17 @@ class MooncakeConnector(KVConnectorBase_V1):
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         assert vllm_config.kv_transfer_config is not None
         self.engine_id = vllm_config.kv_transfer_config.engine_id
-        self._connector_metadata = MooncakeConnectorMetadata()
+        metadata_cls = getattr(self, "metadata_cls", MooncakeConnectorMetadata)
+        scheduler_cls = getattr(self, "scheduler_cls", MooncakeConnectorScheduler)
+        worker_cls = getattr(self, "worker_cls", MooncakeConnectorWorker)
+        self._connector_metadata = metadata_cls()
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler: MooncakeConnectorScheduler | None = MooncakeConnectorScheduler(
-                vllm_config, str(self.engine_id)
-            )
+            self.connector_scheduler: MooncakeConnectorScheduler | None = scheduler_cls(vllm_config, str(self.engine_id))
             self.connector_worker: MooncakeConnectorWorker | None = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
-            self.connector_worker = MooncakeConnectorWorker(vllm_config, str(self.engine_id))
+            self.connector_worker = worker_cls(vllm_config, str(self.engine_id))
 
     ############################################################
     # Scheduler Side Methods
@@ -1093,6 +1096,8 @@ class MooncakeConnectorScheduler:
 class MooncakeConnectorWorker:
     """Implementation of Worker side methods"""
 
+    transfer_engine_global = global_te
+
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
         self._get_prefill_decode_size(vllm_config)
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
@@ -1137,7 +1142,7 @@ class MooncakeConnectorWorker:
         device_index = (self.pp_rank + self.pcp_rank) * self.tp_size + self.tp_rank
         self.handshake_port = self.side_channel_port + device_index
         self.sockets: dict = {}
-        self.engine = global_te.get_transfer_engine(self.side_channel_host, device_name=None)
+        self.engine = self.transfer_engine_global.get_transfer_engine(self.side_channel_host, device_name=None)
         self.te_rpc_port = self.engine.get_rpc_port()
 
         # Background thread for sending or receiving KV caches.
@@ -1231,7 +1236,7 @@ class MooncakeConnectorWorker:
                 kv_caches_base_addr.append(base_addr)
                 ptrs.append(base_addr)
                 lengths.append(region_len)
-        global_te.register_buffer(ptrs, lengths)
+        self.transfer_engine_global.register_buffer(ptrs, lengths)
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
             engine_id=self.engine_id,

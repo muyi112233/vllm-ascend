@@ -68,6 +68,13 @@ We create the example setup with the **MooncakeLayerwiseConnector** from `vllm_a
 For the PD disaggregation part, when using MooncakeLayerwiseConnector: The request first enters the Decoder instance,the Decoder triggers a remote prefill task in reverse via the Metaserver. The Prefill node then executes inference and pushes KV Cache layer-wise to the Decoder, overlapping computation with transmission. Once the transfer is complete, the Decoder seamlessly continues with the subsequent token generation.
 `docs/source/developer_guide/feature_guide/disaggregated_prefill.md` shows the brief idea about the disaggregated prefill.
 
+For users who want a direct block-based KV transfer path backed by
+`yr.datasystem.TransferEngine`, vLLM Ascend also provides
+`YuanrongConnector`. Its usage pattern is aligned with
+`MooncakeConnectorV1` instead of `MooncakeLayerwiseConnector`.
+For a step-by-step deployment example, refer to the Yuanrong tutorial in
+`docs/source/tutorials/features/pd_disaggregation_yuanrong_single_node.md`.
+
 ## Limitations
 
 * Disable `--mm-processor-cache-gb 0` if you want to use cross-process caching
