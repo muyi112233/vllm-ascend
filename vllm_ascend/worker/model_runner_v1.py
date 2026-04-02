@@ -1597,11 +1597,11 @@ class NPUModelRunner(GPUModelRunner):
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
 
+            # vLLM v0.18 defers KV connector finalization during target-model
+            # forward when speculative decoding is enabled. Finalize here after
+            # draft model runs so KV pool save/put can complete.
             if self.speculative_config is not None:
-                kv_connector_output = self._finalize_deferred_kv_connector_output(
-                    scheduler_output,
-                    kv_connector_output,
-                )
+                self.finalize_kv_connector()
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
