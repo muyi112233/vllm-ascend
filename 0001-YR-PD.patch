@@ -1,0 +1,659 @@
+From b86c2608aa37562c44fb4d5023ea79df24a2b77d Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Wed, 1 Apr 2026 21:42:15 +0800
+Subject: [PATCH] =?UTF-8?q?YR=20PD=E5=88=86=E7=A6=BB?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ docs/source/tutorials/features/index.md       |   1 +
+ .../pd_disaggregation_yuanrong_single_node.md | 250 ++++++++++++++++++
+ .../feature_guide/epd_disaggregation.md       |   7 +
+ .../kv_connector/test_yuanrong_connector.py   | 111 ++++++++
+ .../distributed/kv_transfer/__init__.py       |   6 +
+ .../kv_transfer/kv_p2p/mooncake_connector.py  |  21 +-
+ .../kv_transfer/kv_p2p/yuanrong_connector.py  |  19 ++
+ .../utils/yuanrong_transfer_engine.py         | 103 ++++++++
+ 8 files changed, 509 insertions(+), 9 deletions(-)
+ create mode 100644 docs/source/tutorials/features/pd_disaggregation_yuanrong_single_node.md
+ create mode 100644 tests/ut/kv_connector/test_yuanrong_connector.py
+ create mode 100644 vllm_ascend/distributed/kv_transfer/kv_p2p/yuanrong_connector.py
+ create mode 100644 vllm_ascend/distributed/kv_transfer/utils/yuanrong_transfer_engine.py
+
+diff --git a/docs/source/tutorials/features/index.md b/docs/source/tutorials/features/index.md
+index b285fd24..a6add080 100644
+--- a/docs/source/tutorials/features/index.md
++++ b/docs/source/tutorials/features/index.md
+@@ -8,6 +8,7 @@ This section provides tutorials for different features of vLLM Ascend.
+ pd_colocated_mooncake_multi_instance
+ pd_disaggregation_mooncake_single_node
+ pd_disaggregation_mooncake_multi_node
++pd_disaggregation_yuanrong_single_node
+ long_sequence_context_parallel_single_node
+ long_sequence_context_parallel_multi_node
+ suffix_speculative_decoding
+diff --git a/docs/source/tutorials/features/pd_disaggregation_yuanrong_single_node.md b/docs/source/tutorials/features/pd_disaggregation_yuanrong_single_node.md
+new file mode 100644
+index 00000000..9c4ede83
+--- /dev/null
++++ b/docs/source/tutorials/features/pd_disaggregation_yuanrong_single_node.md
+@@ -0,0 +1,250 @@
++# Prefill-Decode Disaggregation with YuanrongConnector
++
++## Getting Started
++
++`YuanrongConnector` provides a direct KV transfer path for PD disaggregation by
++using `yr.datasystem.TransferEngine` as the transport substrate.
++
++This connector is intended for the same usage pattern as
++`MooncakeConnectorV1`:
++
++- the prefill instance acts as `kv_producer`
++- the decode instance acts as `kv_consumer`
++- KV cache blocks are transferred directly between the two instances
++
++This is **not** the same feature as
++`AscendStoreConnector + backend=yuanrong`, which is used for KV Pool and prefix
++cache reuse.
++
++This guide uses a single Atlas 800T A2 server with two NPUs as an example and
++deploys a simple `1P1D` topology.
++
++## Prerequisites
++
++- vLLM Ascend contains `YuanrongConnector`
++- `yr.datasystem` is importable in the runtime environment
++- the prefill and decode processes can reach each other over TCP
++- the selected NPU devices have already passed the usual HCCN and driver checks
++
++## Prepare Yuanrong TransferEngine
++
++`YuanrongConnector` depends only on `yr.datasystem.TransferEngine`.
++It does **not** require `etcd`, `dscli`, or Datasystem worker processes.
++
++### Option A: install from package
++
++```bash
++pip install openyuanrong-datasystem
++python3 -c "from yr.datasystem import TransferEngine; print('Yuanrong TransferEngine is ready')"
++```
++
++### Option B: build from a local `transfer_engine` source tree
++
++If you are developing from a local checkout such as
++`C:\Code\yuanrong-datasystem\transfer_engine`, build the Python package first
++and expose it through `PYTHONPATH`.
++
++```bash
++export TRANSFER_ENGINE_SRC=/path/to/yuanrong-datasystem/transfer_engine
++export TE_BUILD_DIR=/tmp/transfer-engine-build
++export TE_PYTHON_DIR=/tmp/transfer-engine-python
++
++bash "${TRANSFER_ENGINE_SRC}/scripts/build_python_artifacts.sh" \
++  "$(which python3)" \
++  "${TRANSFER_ENGINE_SRC}" \
++  "${TE_BUILD_DIR}" \
++  "${TE_PYTHON_DIR}"
++
++export PYTHONPATH="${TE_PYTHON_DIR}:${PYTHONPATH}"
++export LD_LIBRARY_PATH="${TE_PYTHON_DIR}/lib:${LD_LIBRARY_PATH}"
++
++python3 -c "from yr.datasystem import TransferEngine; print('Yuanrong TransferEngine is ready')"
++```
++
++## Connector Scope and Constraints
++
++- `YuanrongConnector` currently follows the same scheduler and worker flow as
++  `MooncakeConnectorV1`
++- it is a block-based KV transfer connector, not a layerwise push connector
++- if you need reverse-triggered layerwise overlap, keep using
++  `MooncakeLayerwiseConnector`
++- `kv_port` is the fixed side-channel handshake port
++- the Yuanrong transfer engine RPC port is allocated automatically at runtime
++- on multi-node deployments, allow both the configured `kv_port` range and the
++  dynamically allocated transfer-engine RPC ports through the network policy
++
++## Start the Prefill and Decode Instances
++
++The examples below use:
++
++- model: `Qwen2.5-7B-Instruct`
++- prefill HTTP port: `13700`
++- decode HTTP port: `13701`
++- prefill handshake base port: `30000`
++- decode handshake base port: `30100`
++
++### Common environment variables
++
++Set the common network environment variables before starting each process.
++
++```bash
++export HCCL_IF_IP=192.0.0.1
++export GLOO_SOCKET_IFNAME=eth0
++export TP_SOCKET_IFNAME=eth0
++export HCCL_SOCKET_IFNAME=eth0
++export OMP_PROC_BIND=false
++export OMP_NUM_THREADS=10
++```
++
++### Prefill instance
++
++```bash
++export ASCEND_RT_VISIBLE_DEVICES=0
++
++vllm serve /model/Qwen2.5-7B-Instruct \
++  --host 0.0.0.0 \
++  --port 13700 \
++  --served-model-name qwen25 \
++  --tensor-parallel-size 1 \
++  --seed 1024 \
++  --max-model-len 32768 \
++  --max-num-batched-tokens 32768 \
++  --gpu-memory-utilization 0.9 \
++  --trust-remote-code \
++  --no-enable-prefix-caching \
++  --kv-transfer-config \
++  '{
++    "kv_connector": "YuanrongConnector",
++    "kv_role": "kv_producer",
++    "kv_port": "30000",
++    "engine_id": "0",
++    "kv_connector_extra_config": {
++      "prefill": {
++        "dp_size": 1,
++        "tp_size": 1
++      },
++      "decode": {
++        "dp_size": 1,
++        "tp_size": 1
++      }
++    }
++  }'
++```
++
++### Decode instance
++
++```bash
++export ASCEND_RT_VISIBLE_DEVICES=1
++
++vllm serve /model/Qwen2.5-7B-Instruct \
++  --host 0.0.0.0 \
++  --port 13701 \
++  --served-model-name qwen25 \
++  --tensor-parallel-size 1 \
++  --seed 1024 \
++  --max-model-len 32768 \
++  --max-num-batched-tokens 32768 \
++  --gpu-memory-utilization 0.9 \
++  --trust-remote-code \
++  --no-enable-prefix-caching \
++  --kv-transfer-config \
++  '{
++    "kv_connector": "YuanrongConnector",
++    "kv_role": "kv_consumer",
++    "kv_port": "30100",
++    "engine_id": "1",
++    "kv_connector_extra_config": {
++      "prefill": {
++        "dp_size": 1,
++        "tp_size": 1
++      },
++      "decode": {
++        "dp_size": 1,
++        "tp_size": 1
++      }
++    }
++  }'
++```
++
++## Start the PD Proxy
++
++Use the same proxy entry that is used by the existing Mooncake PD example:
++`examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py`
++
++```bash
++python3 /workspace/vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py \
++  --host 192.0.0.1 \
++  --port 8080 \
++  --prefiller-hosts 192.0.0.1 \
++  --prefiller-port 13700 \
++  --decoder-hosts 192.0.0.1 \
++  --decoder-ports 13701
++```
++
++## Verify the Deployment
++
++Send a request to the proxy endpoint:
++
++```bash
++curl http://192.0.0.1:8080/v1/chat/completions \
++  -H "Content-Type: application/json" \
++  -d '{
++    "model": "qwen25",
++    "messages": [
++      {"role": "system", "content": "You are a helpful assistant."},
++      {"role": "user", "content": "Write a short summary of prefilling and decoding in vLLM."}
++    ],
++    "max_tokens": 128,
++    "temperature": 0
++  }'
++```
++
++If the deployment is working correctly:
++
++- the request is accepted by the proxy
++- the prefill process generates remote KV blocks
++- the decode process loads the KV blocks through `YuanrongConnector`
++- the final response is returned from the decode instance
++
++## Troubleshooting
++
++### `ImportError: Please install openyuanrong-datasystem`
++
++`yr.datasystem` is not visible to the current Python environment.
++Either install the package or export the locally built package directory
++through `PYTHONPATH`.
++
++### `torch.npu is unavailable` or wrong device id
++
++`YuanrongConnector` initializes `TransferEngine` with the current NPU device.
++Set `ASCEND_RT_VISIBLE_DEVICES` correctly before starting each vLLM process.
++
++### Handshake succeeds but transfer fails
++
++Check the following:
++
++- prefill and decode nodes can reach each other over TCP
++- `kv_port` is open on both sides
++- the dynamically allocated Yuanrong transfer-engine RPC port is not blocked
++- the two sides are using compatible `yr.datasystem` builds
++
++### Confusion with Yuanrong KV Pool deployment
++
++If your config uses:
++
++```json
++{
++  "kv_connector": "AscendStoreConnector",
++  "kv_connector_extra_config": {
++    "backend": "yuanrong"
++  }
++}
++```
++
++that is the KV Pool path, not `YuanrongConnector`.
++
++## References
++
++- [Yuanrong TransferEngine Python API](https://atomgit.com/openeuler/yuanrong-datasystem)
++- [Mooncake single-node PD tutorial](./pd_disaggregation_mooncake_single_node.md)
++- [EPD disaggregation feature guide](../../user_guide/feature_guide/epd_disaggregation.md)
+diff --git a/docs/source/user_guide/feature_guide/epd_disaggregation.md b/docs/source/user_guide/feature_guide/epd_disaggregation.md
+index 88ef0666..6ec2992b 100644
+--- a/docs/source/user_guide/feature_guide/epd_disaggregation.md
++++ b/docs/source/user_guide/feature_guide/epd_disaggregation.md
+@@ -68,6 +68,13 @@ We create the example setup with the **MooncakeLayerwiseConnector** from `vllm_a
+ For the PD disaggregation part, when using MooncakeLayerwiseConnector: The request first enters the Decoder instance,the Decoder triggers a remote prefill task in reverse via the Metaserver. The Prefill node then executes inference and pushes KV Cache layer-wise to the Decoder, overlapping computation with transmission. Once the transfer is complete, the Decoder seamlessly continues with the subsequent token generation.
+ `docs/source/developer_guide/feature_guide/disaggregated_prefill.md` shows the brief idea about the disaggregated prefill.
+ 
++For users who want a direct block-based KV transfer path backed by
++`yr.datasystem.TransferEngine`, vLLM Ascend also provides
++`YuanrongConnector`. Its usage pattern is aligned with
++`MooncakeConnectorV1` instead of `MooncakeLayerwiseConnector`.
++For a step-by-step deployment example, refer to the Yuanrong tutorial in
++`docs/source/tutorials/features/pd_disaggregation_yuanrong_single_node.md`.
++
+ ## Limitations
+ 
+ * Disable `--mm-processor-cache-gb 0` if you want to use cross-process caching
+diff --git a/tests/ut/kv_connector/test_yuanrong_connector.py b/tests/ut/kv_connector/test_yuanrong_connector.py
+new file mode 100644
+index 00000000..9cd5f7c7
+--- /dev/null
++++ b/tests/ut/kv_connector/test_yuanrong_connector.py
+@@ -0,0 +1,111 @@
++import sys
++import types
++import unittest
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
++
++from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import MooncakeConnectorMetadata
++from vllm_ascend.distributed.kv_transfer.kv_p2p.yuanrong_connector import (
++    YuanrongConnector,
++    YuanrongConnectorWorker,
++)
++from vllm_ascend.distributed.kv_transfer.utils.yuanrong_transfer_engine import (
++    GlobalYuanrongTE,
++    YuanrongTransferEngineAdapter,
++    global_yuanrong_te,
++)
++
++
++class FakeResult:
++    def __init__(self, error: bool = False, msg: str = "ok"):
++        self._error = error
++        self._msg = msg
++
++    def is_error(self) -> bool:
++        return self._error
++
++    def to_string(self) -> str:
++        return self._msg
++
++
++class TestYuanrongTransferEngineAdapter(unittest.TestCase):
++    def test_adapter_maps_result_to_mooncake_style_status(self):
++        raw_engine = MagicMock()
++        raw_engine.get_rpc_port.return_value = 62000
++        raw_engine.register_memory.return_value = FakeResult(error=False)
++        raw_engine.batch_transfer_sync_read.return_value = FakeResult(error=False)
++
++        adapter = YuanrongTransferEngineAdapter(raw_engine)
++
++        self.assertEqual(adapter.get_rpc_port(), 62000)
++        self.assertEqual(adapter.register_memory(0x1000, 128), 0)
++        self.assertEqual(
++            adapter.batch_transfer_sync_read("127.0.0.1:62000", [0x2000], [0x3000], [256]),
++            0,
++        )
++
++        raw_engine.batch_transfer_sync_read.return_value = FakeResult(error=True, msg="transfer failed")
++        self.assertEqual(
++            adapter.batch_transfer_sync_read("127.0.0.1:62000", [0x2000], [0x3000], [256]),
++            -1,
++        )
++
++
++class TestGlobalYuanrongTE(unittest.TestCase):
++    def test_get_transfer_engine_initializes_with_current_device(self):
++        raw_engine = MagicMock()
++        raw_engine.initialize.return_value = FakeResult(error=False)
++        raw_engine.get_rpc_port.return_value = 62000
++
++        fake_yr = types.ModuleType("yr")
++        fake_datasystem = types.ModuleType("yr.datasystem")
++        fake_datasystem.TransferEngine = MagicMock(return_value=raw_engine)
++
++        te = GlobalYuanrongTE()
++        with patch.dict(sys.modules, {"yr": fake_yr, "yr.datasystem": fake_datasystem}):
++            with patch(
++                "vllm_ascend.distributed.kv_transfer.utils.yuanrong_transfer_engine._build_local_endpoint",
++                return_value="127.0.0.1:62000",
++            ), patch(
++                "vllm_ascend.distributed.kv_transfer.utils.yuanrong_transfer_engine._get_default_device_name",
++                return_value="npu:3",
++            ):
++                adapter = te.get_transfer_engine("127.0.0.1", device_name=None)
++
++        raw_engine.initialize.assert_called_once_with("127.0.0.1:62000", "ascend", "npu:3")
++        self.assertIsInstance(adapter, YuanrongTransferEngineAdapter)
++        self.assertEqual(adapter.get_rpc_port(), 62000)
++
++    def test_register_buffer_is_idempotent(self):
++        te = GlobalYuanrongTE()
++        te.transfer_engine = MagicMock()
++        te.transfer_engine.register_memory.return_value = 0
++
++        te.register_buffer([0x1000, 0x2000], [64, 128])
++        te.register_buffer([0x1000, 0x2000], [64, 128])
++
++        self.assertEqual(te.transfer_engine.register_memory.call_count, 2)
++
++
++class TestYuanrongConnector(unittest.TestCase):
++    def test_worker_role_uses_yuanrong_transfer_engine_global(self):
++        self.assertIs(YuanrongConnectorWorker.transfer_engine_global, global_yuanrong_te)
++
++    def test_connector_instantiates_configured_worker(self):
++        vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="engine-1"))
++        mock_worker = MagicMock()
++        worker_cls = MagicMock(return_value=mock_worker)
++
++        with patch.object(YuanrongConnector, "worker_cls", worker_cls):
++            connector = YuanrongConnector(vllm_config, KVConnectorRole.WORKER)
++
++        worker_cls.assert_called_once_with(vllm_config, "engine-1")
++        self.assertIs(connector.connector_worker, mock_worker)
++        self.assertIsNone(connector.connector_scheduler)
++        self.assertIsInstance(connector._connector_metadata, MooncakeConnectorMetadata)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/vllm_ascend/distributed/kv_transfer/__init__.py b/vllm_ascend/distributed/kv_transfer/__init__.py
+index 45d50414..8c2812d4 100644
+--- a/vllm_ascend/distributed/kv_transfer/__init__.py
++++ b/vllm_ascend/distributed/kv_transfer/__init__.py
+@@ -48,6 +48,12 @@ def register_connector():
+         "MooncakeLayerwiseConnector",
+     )
+ 
++    KVConnectorFactory.register_connector(
++        "YuanrongConnector",
++        "vllm_ascend.distributed.kv_transfer.kv_p2p.yuanrong_connector",
++        "YuanrongConnector",
++    )
++
+     KVConnectorFactory.register_connector(
+         "UCMConnector", "vllm_ascend.distributed.kv_transfer.kv_pool.ucm_connector", "UCMConnectorV1"
+     )
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+index 4c692e33..64e0faba 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -21,7 +21,6 @@ import numpy.typing as npt
+ import torch
+ import torch_npu
+ import zmq
+-from mooncake.engine import TransferEngine  # type: ignore
+ from vllm import envs
+ from vllm.config import VllmConfig
+ from vllm.distributed import get_pcp_group
+@@ -54,6 +53,7 @@ from vllm_ascend.utils import enable_custom_op, is_vl_model
+ 
+ # isort: off
+ if TYPE_CHECKING:
++    from mooncake.engine import TransferEngine as MooncakeTransferEngine  # type: ignore
+     from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
+     from vllm.forward_context import ForwardContext
+     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+@@ -305,7 +305,7 @@ class KVCacheRecvingThread(threading.Thread):
+         tp_rank: int,
+         tp_size: int,
+         _prefill_pp_size: int,
+-        engine: TransferEngine,
++        engine: Any,
+         local_engine_id: str,
+         local_handshake_port: int,
+         side_channel_port: int,
+@@ -811,16 +811,17 @@ class MooncakeConnector(KVConnectorBase_V1):
+     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
+         assert vllm_config.kv_transfer_config is not None
+         self.engine_id = vllm_config.kv_transfer_config.engine_id
+-        self._connector_metadata = MooncakeConnectorMetadata()
++        metadata_cls = getattr(self, "metadata_cls", MooncakeConnectorMetadata)
++        scheduler_cls = getattr(self, "scheduler_cls", MooncakeConnectorScheduler)
++        worker_cls = getattr(self, "worker_cls", MooncakeConnectorWorker)
++        self._connector_metadata = metadata_cls()
+ 
+         if role == KVConnectorRole.SCHEDULER:
+-            self.connector_scheduler: MooncakeConnectorScheduler | None = MooncakeConnectorScheduler(
+-                vllm_config, str(self.engine_id)
+-            )
++            self.connector_scheduler: MooncakeConnectorScheduler | None = scheduler_cls(vllm_config, str(self.engine_id))
+             self.connector_worker: MooncakeConnectorWorker | None = None
+         elif role == KVConnectorRole.WORKER:
+             self.connector_scheduler = None
+-            self.connector_worker = MooncakeConnectorWorker(vllm_config, str(self.engine_id))
++            self.connector_worker = worker_cls(vllm_config, str(self.engine_id))
+ 
+     ############################################################
+     # Scheduler Side Methods
+@@ -1092,6 +1093,8 @@ class MooncakeConnectorScheduler:
+ class MooncakeConnectorWorker:
+     """Implementation of Worker side methods"""
+ 
++    transfer_engine_global = global_te
++
+     def __init__(self, vllm_config: VllmConfig, engine_id: str):
+         self._get_prefill_decode_size(vllm_config)
+         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
+@@ -1136,7 +1139,7 @@ class MooncakeConnectorWorker:
+         device_index = (self.pp_rank + self.pcp_rank) * self.tp_size + self.tp_rank
+         self.handshake_port = self.side_channel_port + device_index
+         self.sockets: dict = {}
+-        self.engine = global_te.get_transfer_engine(self.side_channel_host, device_name=None)
++        self.engine = self.transfer_engine_global.get_transfer_engine(self.side_channel_host, device_name=None)
+         self.te_rpc_port = self.engine.get_rpc_port()
+ 
+         # Background thread for sending or receiving KV caches.
+@@ -1230,7 +1233,7 @@ class MooncakeConnectorWorker:
+                 kv_caches_base_addr.append(base_addr)
+                 ptrs.append(base_addr)
+                 lengths.append(region_len)
+-        global_te.register_buffer(ptrs, lengths)
++        self.transfer_engine_global.register_buffer(ptrs, lengths)
+         # After KV Caches registered, start the sending or receiving thread.
+         metadata = MooncakeAgentMetadata(
+             engine_id=self.engine_id,
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/yuanrong_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/yuanrong_connector.py
+new file mode 100644
+index 00000000..c2fe632c
+--- /dev/null
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/yuanrong_connector.py
+@@ -0,0 +1,19 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (
++    MooncakeConnector,
++    MooncakeConnectorMetadata,
++    MooncakeConnectorWorker,
++)
++from vllm_ascend.distributed.kv_transfer.utils.yuanrong_transfer_engine import (
++    global_yuanrong_te,
++)
++
++
++class YuanrongConnectorWorker(MooncakeConnectorWorker):
++    transfer_engine_global = global_yuanrong_te
++
++
++class YuanrongConnector(MooncakeConnector):
++    metadata_cls = MooncakeConnectorMetadata
++    worker_cls = YuanrongConnectorWorker
+diff --git a/vllm_ascend/distributed/kv_transfer/utils/yuanrong_transfer_engine.py b/vllm_ascend/distributed/kv_transfer/utils/yuanrong_transfer_engine.py
+new file mode 100644
+index 00000000..99c9c49b
+--- /dev/null
++++ b/vllm_ascend/distributed/kv_transfer/utils/yuanrong_transfer_engine.py
+@@ -0,0 +1,103 @@
++import socket
++import threading
++
++import torch
++from vllm.logger import logger
++from vllm.utils.network_utils import split_host_port
++
++
++def _allocate_local_port(hostname: str) -> int:
++    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
++        sock.bind((hostname, 0))
++        return int(sock.getsockname()[1])
++
++
++def _build_local_endpoint(hostname: str) -> str:
++    try:
++        split_host_port(hostname)
++        return hostname
++    except Exception:
++        return f"{hostname}:{_allocate_local_port(hostname)}"
++
++
++def _get_default_device_name() -> str:
++    if not hasattr(torch, "npu"):
++        raise RuntimeError("torch.npu is unavailable, cannot initialize yuanrong transfer engine.")
++    return f"npu:{int(torch.npu.current_device())}"
++
++
++class YuanrongTransferEngineAdapter:
++    def __init__(self, transfer_engine):
++        self._transfer_engine = transfer_engine
++
++    def get_rpc_port(self) -> int:
++        return int(self._transfer_engine.get_rpc_port())
++
++    def register_memory(self, ptr: int, size: int) -> int:
++        result = self._transfer_engine.register_memory(ptr, size)
++        if result.is_error():
++            logger.error("Yuanrong register_memory failed: %s", result.to_string())
++            return -1
++        return 0
++
++    def batch_transfer_sync_read(
++        self,
++        target_hostname: str,
++        buffers: list[int],
++        peer_buffer_addresses: list[int],
++        lengths: list[int],
++    ) -> int:
++        result = self._transfer_engine.batch_transfer_sync_read(
++            target_hostname,
++            buffers,
++            peer_buffer_addresses,
++            lengths,
++        )
++        if result.is_error():
++            logger.error("Yuanrong batch_transfer_sync_read failed: %s", result.to_string())
++            return -1
++        return 0
++
++
++class GlobalYuanrongTE:
++    def __init__(self):
++        self.transfer_engine = None
++        self.is_register_buffer: bool = False
++        self.transfer_engine_lock = threading.Lock()
++        self.register_buffer_lock = threading.Lock()
++
++    def get_transfer_engine(self, hostname: str, device_name: str | None):
++        if self.transfer_engine is None:
++            with self.transfer_engine_lock:
++                if self.transfer_engine is None:
++                    try:
++                        from yr.datasystem import TransferEngine  # type: ignore[import-not-found]
++                    except ImportError as e:
++                        raise ImportError(
++                            "Please install openyuanrong-datasystem to run vLLM with YuanrongConnector."
++                        ) from e
++                    engine = TransferEngine()
++                    local_endpoint = _build_local_endpoint(hostname)
++                    normalized_device_name = device_name or _get_default_device_name()
++                    result = engine.initialize(local_endpoint, "ascend", normalized_device_name)
++                    if result.is_error():
++                        raise RuntimeError(
++                            "Yuanrong TransferEngine initialization failed: "
++                            f"{result.to_string()}"
++                        )
++                    self.transfer_engine = YuanrongTransferEngineAdapter(engine)
++        return self.transfer_engine
++
++    def register_buffer(self, ptrs: list[int], sizes: list[int]):
++        with self.register_buffer_lock:
++            assert self.transfer_engine is not None, "Transfer engine must be initialized"
++            if self.is_register_buffer:
++                return
++            for ptr, size in zip(ptrs, sizes):
++                ret_value = self.transfer_engine.register_memory(ptr, size)
++                if ret_value != 0:
++                    raise RuntimeError("Yuanrong memory registration failed.")
++            self.is_register_buffer = True
++
++
++global_yuanrong_te = GlobalYuanrongTE()
+-- 
+2.51.0.windows.1
+
