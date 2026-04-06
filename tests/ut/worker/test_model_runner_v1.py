@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
@@ -83,6 +83,41 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+
+    def test_finalize_deferred_kv_connector_output_waits_for_save(self):
+        runner = self._build_runner()
+        scheduler_output = SimpleNamespace(finished_req_ids={"req-1"})
+        kv_connector_output = SimpleNamespace(
+            finished_sending=[],
+            finished_recving=[],
+            invalid_block_ids=None,
+            kv_connector_stats=None,
+            kv_cache_events=None,
+        )
+        kv_connector = MagicMock()
+        kv_connector.get_finished.return_value = ({"req-1"}, set())
+        kv_connector.get_block_ids_with_load_errors.return_value = {3}
+        kv_connector.get_kv_connector_stats.return_value = {"save": 1}
+        kv_connector.get_kv_connector_kv_cache_events.return_value = ["event"]
+
+        with (
+            patch("vllm_ascend.worker.model_runner_v1.has_kv_transfer_group", return_value=True),
+            patch("vllm_ascend.worker.model_runner_v1.get_kv_transfer_group", return_value=kv_connector),
+        ):
+            result = runner._finalize_deferred_kv_connector_output(
+                scheduler_output,
+                kv_connector_output,
+            )
+
+        self.assertIs(result, kv_connector_output)
+        kv_connector.wait_for_save.assert_called_once_with()
+        kv_connector.get_finished.assert_called_once_with({"req-1"})
+        kv_connector.clear_connector_metadata.assert_called_once_with()
+        self.assertEqual(result.finished_sending, {"req-1"})
+        self.assertEqual(result.finished_recving, set())
+        self.assertEqual(result.invalid_block_ids, {3})
+        self.assertEqual(result.kv_connector_stats, {"save": 1})
+        self.assertEqual(result.kv_cache_events, ["event"])
 
 
 if __name__ == "__main__":

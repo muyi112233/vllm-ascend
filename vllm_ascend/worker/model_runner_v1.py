@@ -1466,6 +1466,26 @@ class NPUModelRunner(GPUModelRunner):
             self.kv_connector_output = kv_connector_output
         return None
 
+    def _finalize_deferred_kv_connector_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        kv_connector_output: Any | None,
+    ) -> Any | None:
+        if kv_connector_output is None or not has_kv_transfer_group():
+            return kv_connector_output
+
+        kv_connector = get_kv_transfer_group()
+        kv_connector.wait_for_save()
+        (
+            kv_connector_output.finished_sending,
+            kv_connector_output.finished_recving,
+        ) = kv_connector.get_finished(scheduler_output.finished_req_ids)
+        kv_connector_output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
+        kv_connector_output.kv_connector_stats = kv_connector.get_kv_connector_stats()
+        kv_connector_output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
+        kv_connector.clear_connector_metadata()
+        return kv_connector_output
+
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -1577,8 +1597,11 @@ class NPUModelRunner(GPUModelRunner):
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
 
-            if has_kv_transfer_group():
-                get_kv_transfer_group().clear_connector_metadata()
+            if self.speculative_config is not None:
+                kv_connector_output = self._finalize_deferred_kv_connector_output(
+                    scheduler_output,
+                    kv_connector_output,
+                )
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
