@@ -53,6 +53,12 @@ class YuanrongTransferEngineAdapter:
         peer_buffer_addresses: list[int],
         lengths: list[int],
     ) -> int:
+        logger.info(
+            "[YR-DIAG] te_batch_transfer_begin session_id=%s buffer_count=%d total_bytes=%d",
+            target_hostname,
+            len(buffers),
+            sum(lengths),
+        )
         result = self._transfer_engine.batch_transfer_sync_read(
             target_hostname,
             buffers,
@@ -62,6 +68,12 @@ class YuanrongTransferEngineAdapter:
         if result.is_error():
             logger.error("Yuanrong batch_transfer_sync_read failed: %s", result.to_string())
             return -1
+        logger.info(
+            "[YR-DIAG] te_batch_transfer_end session_id=%s buffer_count=%d total_bytes=%d",
+            target_hostname,
+            len(buffers),
+            sum(lengths),
+        )
         return 0
 
 
