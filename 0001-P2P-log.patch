@@ -1,0 +1,317 @@
+From f09ee174a597193b1d9083ccc373fd0daeae1eee Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Tue, 7 Apr 2026 18:38:46 +0800
+Subject: [PATCH] P2P log
+
+---
+ .../kv_transfer/kv_p2p/mooncake_connector.py  | 143 +++++++++++++++++-
+ .../utils/yuanrong_transfer_engine.py         |  12 ++
+ 2 files changed, 154 insertions(+), 1 deletion(-)
+
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+index 957e4b99..430f3bc3 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -64,6 +64,10 @@ GET_META_MSG = b"get_meta_msg"
+ DONE_RECVING_MSG = b"done_recving_msg"
+ 
+ 
++def _is_yuanrong_runtime(transfer_engine_global: Any) -> bool:
++    return transfer_engine_global.__class__.__name__ == "GlobalYuanrongTE"
++
++
+ class RemotePortInfo(TypedDict):
+     num: int
+     host: str
+@@ -315,6 +319,7 @@ class KVCacheRecvingThread(threading.Thread):
+         vllm_config: VllmConfig,
+         kv_caches: dict[str, Any],
+         prefill_pp_layer_partition: str | None = None,
++        is_yuanrong_connector: bool = False,
+     ):
+         super().__init__(daemon=True, name="KVCacheRecvingThread")
+         self.tp_rank = tp_rank
+@@ -326,6 +331,7 @@ class KVCacheRecvingThread(threading.Thread):
+         self.engine = engine
+         self.ready_event = ready_event
+         self.device = torch.device(f"npu:{int(torch.npu.current_device())}")
++        self.is_yuanrong_connector = is_yuanrong_connector
+ 
+         self.kv_caches = kv_caches
+         self.kv_caches_base_addr: dict[str, dict[int, list[int]]] = SizedDict()
+@@ -415,6 +421,14 @@ class KVCacheRecvingThread(threading.Thread):
+     def run(self):
+         """Run the thread to handle KV cache transfer requests."""
+         torch.npu.set_device(self.device)
++        if self.is_yuanrong_connector:
++            logger.info(
++                "[YR-DIAG] recv_thread_start local_engine_id=%s tp_rank=%s local_handshake_port=%s device=%s",
++                self.local_engine_id,
++                self.tp_rank,
++                self.local_handshake_port,
++                self.device,
++            )
+         self.ready_event.set()
+         while True:
+             try:
+@@ -436,12 +450,43 @@ class KVCacheRecvingThread(threading.Thread):
+         all_task_done = req_meta["all_task_done"]
+ 
+         try:
++            if self.is_yuanrong_connector:
++                logger.info(
++                    "[YR-DIAG] transfer_begin req=%s remote_req=%s tp_rank=%s remote_engine=%s remote_host=%s "
++                    "remote_handshake_port=%s local_blocks=%d remote_blocks=%d",
++                    request_id,
++                    remote_request_id,
++                    self.tp_rank,
++                    req_meta["remote_engine_id"],
++                    remote_host,
++                    remote_handshake_port,
++                    len(req_meta["local_block_ids"]),
++                    len(req_meta["remote_block_ids"]),
++                )
+             logger.debug(f"Starting to transfer KV cache for request {remote_request_id}.")
+             self._transfer_kv_cache(req_meta)
++            if self.is_yuanrong_connector:
++                logger.info(
++                    "[YR-DIAG] transfer_done req=%s remote_req=%s tp_rank=%s",
++                    request_id,
++                    remote_request_id,
++                    self.tp_rank,
++                )
+             logger.debug(f"Finished transferring KV cache for request {remote_request_id}.")
+         except Exception as e:
+             logger.error(f"Failed to transfer KV cache for request {remote_request_id}: {e}", exc_info=True)
+         finally:
++            if self.is_yuanrong_connector:
++                logger.info(
++                    "[YR-DIAG] done_signal_begin req=%s remote_req=%s tp_rank=%s remote_host=%s "
++                    "remote_handshake_port=%s all_task_done=%s",
++                    request_id,
++                    remote_request_id,
++                    self.tp_rank,
++                    remote_host,
++                    remote_handshake_port,
++                    all_task_done,
++                )
+             self._send_done_signal_to_free_remote_port(remote_request_id, remote_host, remote_port_send_num)
+             if all_task_done:
+                 if len(req_meta["local_block_ids"]) > 0:
+@@ -453,6 +498,13 @@ class KVCacheRecvingThread(threading.Thread):
+             # resource cleanup. Failing to do so may cause a memory leak on the
+             # remote host.
+             self._send_done_recv_signal(remote_request_id, remote_host, remote_handshake_port, remote_port_send_num)
++            if self.is_yuanrong_connector:
++                logger.info(
++                    "[YR-DIAG] done_signal_end req=%s remote_req=%s tp_rank=%s",
++                    request_id,
++                    remote_request_id,
++                    self.tp_rank,
++                )
+ 
+     def _send_done_signal_to_free_remote_port(
+         self, request_id: str, remote_host: str, remote_port_send_num: dict[int, RemotePortInfo]
+@@ -545,10 +597,27 @@ class KVCacheRecvingThread(threading.Thread):
+                 dst_list.append(dst)
+                 length_list.append(length)
+ 
++        if self.is_yuanrong_connector:
++            logger.info(
++                "[YR-DIAG] batch_read_begin remote_req=%s tp_rank=%s session_id=%s transfer_items=%d total_bytes=%d",
++                remote_request_id,
++                self.tp_rank,
++                session_id,
++                len(src_list),
++                sum(length_list),
++            )
+         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+         if ret < 0:
+             logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
+             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
++        if self.is_yuanrong_connector:
++            logger.info(
++                "[YR-DIAG] batch_read_end remote_req=%s tp_rank=%s session_id=%s ret=%s",
++                remote_request_id,
++                self.tp_rank,
++                session_id,
++                ret,
++            )
+ 
+         req_end_time = time.perf_counter()
+         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
+@@ -726,6 +795,14 @@ class KVCacheRecvingThread(threading.Thread):
+         )
+         sock: zmq.Socket | None = None  # type: ignore
+         try:
++            if self.is_yuanrong_connector:
++                logger.info(
++                    "[YR-DIAG] ack_send_begin req=%s tp_rank=%s remote_host=%s remote_handshake_port=%s",
++                    request_id,
++                    self.tp_rank,
++                    remote_host,
++                    remote_handshake_port,
++                )
+             sock = self._get_remote_socket(remote_host, remote_handshake_port)
+             data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id, remote_port_send_num))
+             ensure_zmq_send(sock, data_bytes, f"{remote_host}:{remote_handshake_port}")
+@@ -738,6 +815,15 @@ class KVCacheRecvingThread(threading.Thread):
+                     "Failed to receive ACK for request %s from %s:%d", request_id, remote_host, remote_handshake_port
+                 )
+                 raise RuntimeError(f"Failed to receive ACK, resp: {resp.decode('utf-8')}")
++            if self.is_yuanrong_connector:
++                logger.info(
++                    "[YR-DIAG] ack_send_end req=%s tp_rank=%s remote_host=%s remote_handshake_port=%s resp=%s",
++                    request_id,
++                    self.tp_rank,
++                    remote_host,
++                    remote_handshake_port,
++                    resp.decode("utf-8"),
++                )
+         except RuntimeError as e:
+             if isinstance(sock, zmq.Socket):  # type: ignore
+                 sock.close()
+@@ -863,12 +949,28 @@ class MooncakeConnector(KVConnectorBase_V1):
+     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+         """Get the finished recving and sending requests."""
+         assert self.connector_worker is not None
+-        return self.connector_worker.get_finished()
++        done_sending, done_recving = self.connector_worker.get_finished()
++        if self.connector_worker.is_yuanrong_connector and (done_sending or done_recving):
++            logger.info(
++                "[YR-DIAG] connector_get_finished done_sending=%s done_recving=%s",
++                sorted(done_sending),
++                sorted(done_recving),
++            )
++        return done_sending, done_recving
+ 
+     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+         assert self.connector_worker is not None
+         assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
++        if self.connector_worker.is_yuanrong_connector:
++            logger.info(
++                "[YR-DIAG] connector_start_load_kv_begin req_ids=%s reqs_in_batch=%s requests_to_send=%s",
++                sorted(self._connector_metadata.requests.keys()),
++                list(self._connector_metadata.reqs_in_batch),
++                sorted(self._connector_metadata.requests_to_send.keys()),
++            )
+         self.connector_worker.start_load_kv(self._connector_metadata)
++        if self.connector_worker.is_yuanrong_connector:
++            logger.info("[YR-DIAG] connector_start_load_kv_end")
+ 
+     def wait_for_layer_load(self, layer_name: str) -> None:
+         """MooncakeConnector does not do layerwise saving."""
+@@ -1142,6 +1244,7 @@ class MooncakeConnectorWorker:
+         device_index = (self.pp_rank + self.pcp_rank) * self.tp_size + self.tp_rank
+         self.handshake_port = self.side_channel_port + device_index
+         self.sockets: dict = {}
++        self.is_yuanrong_connector = _is_yuanrong_runtime(self.transfer_engine_global)
+         self.engine = self.transfer_engine_global.get_transfer_engine(self.side_channel_host, device_name=None)
+         self.te_rpc_port = self.engine.get_rpc_port()
+ 
+@@ -1277,6 +1380,7 @@ class MooncakeConnectorWorker:
+                 self.vllm_config,
+                 self.kv_caches,
+                 self._prefill_pp_layer_partition,
++                is_yuanrong_connector=self.is_yuanrong_connector,
+             )
+             self.kv_recv_thread.start()
+ 
+@@ -1309,6 +1413,14 @@ class MooncakeConnectorWorker:
+                 len(done_sending),
+                 len(done_recving),
+             )
++        if self.is_yuanrong_connector and (done_sending or done_recving):
++            logger.info(
++                "[YR-DIAG] worker_get_finished tp_rank=%s role=%s done_sending=%s done_recving=%s",
++                self.tp_rank,
++                self.kv_role,
++                sorted(done_sending),
++                sorted(done_recving),
++            )
+         return done_sending, done_recving
+ 
+     def _get_kv_split_metadata(
+@@ -1524,6 +1636,14 @@ class MooncakeConnectorWorker:
+ 
+     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+         """Start loading KV blocks from remote engine."""
++        if self.is_yuanrong_connector:
++            logger.info(
++                "[YR-DIAG] worker_start_load_kv_begin tp_rank=%s role=%s req_ids=%s reqs_in_batch=%s",
++                self.tp_rank,
++                self.kv_role,
++                sorted(metadata.requests.keys()),
++                list(metadata.reqs_in_batch),
++            )
+         for req_id, meta in metadata.requests.items():
+             logger.debug(
+                 "start_load_kv for request %s from remote engine %s. "
+@@ -1537,6 +1657,19 @@ class MooncakeConnectorWorker:
+             prefill_tp_size = meta.remote_ptp_size if getattr(meta, "remote_ptp_size", None) else self._prefill_tp_size
+             tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
+             remote_req_id = meta.remote_request_id
++            if self.is_yuanrong_connector:
++                logger.info(
++                    "[YR-DIAG] worker_start_load_kv_enqueue tp_rank=%s req=%s remote_req=%s remote_engine=%s "
++                    "remote_port=%s tp_num_need_pulls=%s local_blocks=%d remote_blocks=%d",
++                    self.tp_rank,
++                    req_id,
++                    remote_req_id,
++                    meta.remote_engine_id,
++                    meta.remote_port,
++                    tp_num_need_pulls,
++                    len(meta.local_block_ids),
++                    len(meta.remote_block_ids),
++                )
+ 
+             if meta.remote_pcp_size * meta.remote_dcp_size > 1:
+                 remote_handshake_port_list, local_block_ids_list, remote_block_ids_list = self._get_kv_split_metadata(
+@@ -1609,6 +1742,14 @@ class MooncakeConnectorWorker:
+         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size > 1:
+             for req_id, delay_start_time in metadata.requests_to_send.items():
+                 self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
++        if self.is_yuanrong_connector:
++            logger.info(
++                "[YR-DIAG] worker_start_load_kv_end tp_rank=%s role=%s tracked_batch=%s requests_to_send=%s",
++                self.tp_rank,
++                self.kv_role,
++                list(metadata.reqs_in_batch),
++                sorted(metadata.requests_to_send.keys()),
++            )
+ 
+     def _get_tp_num_need_pulls(self, prefill_tp_size: int) -> int:
+         if prefill_tp_size is None:
+diff --git a/vllm_ascend/distributed/kv_transfer/utils/yuanrong_transfer_engine.py b/vllm_ascend/distributed/kv_transfer/utils/yuanrong_transfer_engine.py
+index 342128be..3ce06817 100644
+--- a/vllm_ascend/distributed/kv_transfer/utils/yuanrong_transfer_engine.py
++++ b/vllm_ascend/distributed/kv_transfer/utils/yuanrong_transfer_engine.py
+@@ -53,6 +53,12 @@ class YuanrongTransferEngineAdapter:
+         peer_buffer_addresses: list[int],
+         lengths: list[int],
+     ) -> int:
++        logger.info(
++            "[YR-DIAG] te_batch_transfer_begin session_id=%s buffer_count=%d total_bytes=%d",
++            target_hostname,
++            len(buffers),
++            sum(lengths),
++        )
+         result = self._transfer_engine.batch_transfer_sync_read(
+             target_hostname,
+             buffers,
+@@ -62,6 +68,12 @@ class YuanrongTransferEngineAdapter:
+         if result.is_error():
+             logger.error("Yuanrong batch_transfer_sync_read failed: %s", result.to_string())
+             return -1
++        logger.info(
++            "[YR-DIAG] te_batch_transfer_end session_id=%s buffer_count=%d total_bytes=%d",
++            target_hostname,
++            len(buffers),
++            sum(lengths),
++        )
+         return 0
+ 
+ 
+-- 
+2.51.0.windows.1
+
