@@ -63,9 +63,45 @@ if TYPE_CHECKING:
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
 
+YUANRONG_MAX_TRANSFER_ITEMS_PER_BATCH = 256
+YUANRONG_MAX_TRANSFER_BYTES_PER_BATCH = 64 * 1024 * 1024
+
 
 def _is_yuanrong_runtime(transfer_engine_global: Any) -> bool:
     return transfer_engine_global.__class__.__name__ == "GlobalYuanrongTE"
+
+
+def _chunk_transfer_slices(
+    src_list: list[int],
+    dst_list: list[int],
+    length_list: list[int],
+    max_items_per_batch: int,
+    max_bytes_per_batch: int,
+) -> Iterator[tuple[list[int], list[int], list[int]]]:
+    if len(src_list) != len(dst_list) or len(src_list) != len(length_list):
+        raise ValueError("Transfer metadata length mismatch.")
+
+    chunk_src: list[int] = []
+    chunk_dst: list[int] = []
+    chunk_len: list[int] = []
+    chunk_bytes = 0
+
+    for src, dst, length in zip(src_list, dst_list, length_list):
+        should_flush = bool(chunk_src) and (
+            len(chunk_src) >= max_items_per_batch or chunk_bytes + length > max_bytes_per_batch
+        )
+        if should_flush:
+            yield chunk_src, chunk_dst, chunk_len
+            chunk_src, chunk_dst, chunk_len = [], [], []
+            chunk_bytes = 0
+
+        chunk_src.append(src)
+        chunk_dst.append(dst)
+        chunk_len.append(length)
+        chunk_bytes += length
+
+    if chunk_src:
+        yield chunk_src, chunk_dst, chunk_len
 
 
 class RemotePortInfo(TypedDict):
@@ -606,10 +642,44 @@ class KVCacheRecvingThread(threading.Thread):
                 len(src_list),
                 sum(length_list),
             )
-        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
-        if ret < 0:
-            logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
-            raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+
+        transfer_batches: Iterator[tuple[list[int], list[int], list[int]]]
+        if self.is_yuanrong_connector:
+            transfer_batches = _chunk_transfer_slices(
+                src_list,
+                dst_list,
+                length_list,
+                YUANRONG_MAX_TRANSFER_ITEMS_PER_BATCH,
+                YUANRONG_MAX_TRANSFER_BYTES_PER_BATCH,
+            )
+        else:
+            transfer_batches = iter(((src_list, dst_list, length_list),))
+
+        ret = 0
+        for batch_index, (batch_src, batch_dst, batch_len) in enumerate(transfer_batches):
+            if self.is_yuanrong_connector:
+                logger.info(
+                    "[YR-DIAG] batch_read_chunk_begin remote_req=%s tp_rank=%s session_id=%s chunk_index=%d "
+                    "chunk_items=%d chunk_bytes=%d",
+                    remote_request_id,
+                    self.tp_rank,
+                    session_id,
+                    batch_index,
+                    len(batch_src),
+                    sum(batch_len),
+                )
+            ret = self.engine.batch_transfer_sync_read(session_id, batch_src, batch_dst, batch_len)
+            if ret < 0:
+                logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
+                raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+            if self.is_yuanrong_connector:
+                logger.info(
+                    "[YR-DIAG] batch_read_chunk_end remote_req=%s tp_rank=%s session_id=%s chunk_index=%d",
+                    remote_request_id,
+                    self.tp_rank,
+                    session_id,
+                    batch_index,
+                )
         if self.is_yuanrong_connector:
             logger.info(
                 "[YR-DIAG] batch_read_end remote_req=%s tp_rank=%s session_id=%s ret=%s",

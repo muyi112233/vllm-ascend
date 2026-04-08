@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import MooncakeConnectorMetadata
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (
+    MooncakeConnectorMetadata,
+    _chunk_transfer_slices,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.yuanrong_connector import (
     YuanrongConnector,
     YuanrongConnectorWorker,
@@ -90,6 +93,45 @@ class TestGlobalYuanrongTE(unittest.TestCase):
 
 
 class TestYuanrongConnector(unittest.TestCase):
+    def test_chunk_transfer_slices_splits_by_item_limit(self):
+        chunks = list(
+            _chunk_transfer_slices(
+                [1, 2, 3, 4, 5],
+                [11, 12, 13, 14, 15],
+                [10, 10, 10, 10, 10],
+                max_items_per_batch=2,
+                max_bytes_per_batch=100,
+            )
+        )
+
+        self.assertEqual(
+            chunks,
+            [
+                ([1, 2], [11, 12], [10, 10]),
+                ([3, 4], [13, 14], [10, 10]),
+                ([5], [15], [10]),
+            ],
+        )
+
+    def test_chunk_transfer_slices_splits_by_byte_limit(self):
+        chunks = list(
+            _chunk_transfer_slices(
+                [1, 2, 3],
+                [11, 12, 13],
+                [40, 50, 30],
+                max_items_per_batch=10,
+                max_bytes_per_batch=80,
+            )
+        )
+
+        self.assertEqual(
+            chunks,
+            [
+                ([1], [11], [40]),
+                ([2, 3], [12, 13], [50, 30]),
+            ],
+        )
+
     def test_worker_role_uses_yuanrong_transfer_engine_global(self):
         self.assertIs(YuanrongConnectorWorker.transfer_engine_global, global_yuanrong_te)
 
