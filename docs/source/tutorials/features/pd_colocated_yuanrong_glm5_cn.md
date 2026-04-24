@@ -251,6 +251,8 @@ etcdctl version
 
 ## 启动 Yuanrong 服务
 
+如果你当前的目标只是验证 `yuanrong_backend` 的本地 SSD spill，而不是按本教程完成整套 GLM-5 单实例部署，可以直接使用仓库中的 `docs/source/tutorials/features/run_yr_worker_spill_ssd.sh`。脚本的变量说明、启动方式和排查方法见 [run_yr_worker_spill_ssd.sh 使用说明](run_yr_worker_spill_ssd_cn.md)。
+
 ### A3 单机
 
 A3 单机部署只需在一个节点启动 etcd 和 Datasystem Worker。

@@ -187,7 +187,6 @@ export SHM_SIZE=512000
 export NODE_TIMEOUT=30
 export NODE_DEAD_TIMEOUT=60
 export LIVENESS_PATH=/workspace/liveness
-mkdir -p ${LIVENESS_PATH}
 
 etcd \
   --name etcd-single \
@@ -231,7 +230,6 @@ export SHM_SIZE=512000
 export NODE_TIMEOUT=30
 export NODE_DEAD_TIMEOUT=60
 export LIVENESS_PATH=/workspace/liveness
-mkdir -p ${LIVENESS_PATH}
 
 dscli start -w \
   --worker_address ${HOST_IP}:${WORKER_PORT} \

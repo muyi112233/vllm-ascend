@@ -6,8 +6,12 @@ This section provides tutorials for different features of vLLM Ascend.
 :caption: Feature Tutorials
 :maxdepth: 1
 pd_colocated_mooncake_multi_instance
+run_yr_worker_spill_ssd_cn
 pd_disaggregation_mooncake_single_node
 pd_disaggregation_mooncake_multi_node
+pd_disagg_yuanrong_glm5_a3_dual_node_cn
+pd_disagg_yuanrong_glm5_w8a8_a3_dual_node_cn
+pd_disagg_yuanrong_glm51_w8a8_a3_large_ep_4nodes_cn
 long_sequence_context_parallel_single_node
 long_sequence_context_parallel_multi_node
 suffix_speculative_decoding

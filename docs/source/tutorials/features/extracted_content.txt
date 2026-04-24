@@ -1,0 +1,3343 @@
+
+# 前言
+
+## 概述
+
+本文档主要介绍了GLM-5.1模型在昇腾部署测试相关事宜。
+## 修订记录
+
+# GLM-5.1安装部署指导
+
+## 整体作业流程介绍
+
+## 前置准备
+
+### 环境检查（单机、双机、多机）如果是双机多机有组网
+
+#### 硬件约束
+
+##### 设备
+
+##### 组网
+
+- A3灵衢背靠背
+
+- 两台设备的灵衢总线7个平面，每个平面8对网口，每一对接口线路要直连。
+- 要求两个直连NPU配置为同一个网段。
+通过灵衢总线互联，保证任意两个A3设备之间能够互通。
+- A2多机ROCE组网
+
+通过交换机形成fullmesh组网，保证任意两个A2设备之间能够互通。
+- A3多机组网（灵衢）
+
+通过灵衢总线互联，保证任意两个A3设备之间能够互通。
+#### 检查HDK版本
+
+HDK建议采用25.5.0版本
+版本配套信息如下。转测版本镜像除HDK外，其他配套组件均已打包至镜像中，仅需在宿主机裸机环境安装配套HDK。
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    - 检查HDK版本
+
+#### 网络检查
+
+打流测试，查看NPU之间的通信是否正常, 在各节点上依次执行以下命令。执行结果必须全部success（成功），且状态必须为 UP（运行中）。
+（1）A2多机
+```
+# 检查对端交换机端口
+for i in {0..7}; do hccn_tool -i $i -lldp -g | grep Ifname; done
+#  获取以太网口链路状态 (UP 或 DOWN)
+for i in {0..7}; do hccn_tool -i $i -link -g ; done
+#  检查网络健康状态
+for i in {0..7}; do hccn_tool -i $i -net_health -g ; done
+# 查看网络探测 IP 配置
+for i in {0..7}; do hccn_tool -i $i -netdetect -g ; done
+# 查看网关配置
+for i in {0..7}; do hccn_tool -i $i -gateway -g ; done
+# 查看 NPU 网络配置文件
+cat /etc/hccn.conf
+```
+
+获取NPU IP地址
+```bash
+for i in {0..7}; do hccn_tool -i $i -ip -g;done
+```
+
+多机之间连通检查
+```
+#  Execute on the target node (replace 'x.x.x.x' with actual npu ip address)
+for i in {0..7}; do hccn_tool -i $i -ping -g address x.x.x.x;done
+```
+
+（2）A3多机
+1，查看NPU状态，在每个服务器节点执行：
+```
+npu-smi info
+```
+
+2，检查vnic通信状态，跨节点ping测试：
+获取 NPU IP 地址：
+```bash
+for i in {0..15}; do hccn_tool -i $i -vnic -g;done
+```
+
+跨节点ping测试：
+```bash
+for i in {0..15}; do hccn_tool -i $i -hccs_ping -g address x.x.x.x;done
+```
+
+### 模型权重下载
+
+#### 量化后模型权重下载
+
+GLM-5.1-w4a8权重下载地址：
+https://www.modelscope.cn/models/Eco-Tech/GLM-5.1-w4a8
+GLM-5.1-w8a8权重下载地址：
+https://www.modelscope.cn/models/Eco-Tech/GLM-5.1-w8a8
+### 推理引擎镜像下载
+
+A2/A3镜像下载：
+https://quay.io/repository/ascend/vllm-ascend?tab=tags
+
+A2 Ubuntu镜像下载命令：
+```bash
+docker pull quay.io/ascend/vllm-ascend:v0.18.0rc1
+```
+
+A2 openeuler镜像下载命令：
+```bash
+docker pull quay.io/ascend/vllm-ascend:v0.18.0rc1-openeuler
+```
+
+A3 Ubuntu镜像下载命令：
+```bash
+docker pull quay.io/ascend/vllm-ascend:v0.18.0rc1-a3
+```
+
+A3 openeuler镜像下载命令：
+```bash
+docker pull quay.io/ascend/vllm-ascend:v0.18.0rc1-a3-openeuler
+```
+
+### 推理引擎镜像加载
+
+将下载的镜像tar包拷贝到服务器后，需要load为容器镜像，执行命令：
+```bash
+docker load -i v0.18.0rc1-a3.tar
+```
+
+加载后截图：
+
+记录镜像ID为ac1c767e5aa2
+### 检查容器中的transformers版本
+
+配套镜像transformers版本过低，导致GLM.5.1的服务启动失败，需要升级transformers
+```
+pip install --upgrade transformers==5.4.0
+```
+
+## GLM-5.1部署指南（裸金属部署场景）
+
+### 单机A3（w4a8）部署指南
+
+#### 启动容器
+
+```
+#以下保存为start-docker.sh脚本
+#!/bin/bash
+IMAGES_ID="$1"
+NAME="$2"
+# 检查参数数量（需要2个：镜像ID和容器名）
+if [ $# -ne 2 ]; then
+echo "error: 需要传入2个参数，格式：$0 <镜像ID> <容器名>"
+exit 1
+fi
+# 检查镜像是否存在
+if ! docker images --format "{{.ID}}" | grep -q "^${IMAGES_ID:0:12}$"; then
+echo "error: 镜像ID $IMAGES_ID 不存在"
+exit 1
+fi
+# 启动容器（变量加引号，避免特殊字符问题）
+docker run --name "${NAME}" -it -d --net=host --shm-size=500g \
+--privileged=true \
+-w /home \
+--device=/dev/davinci_manager \
+--device=/dev/hisi_hdc \
+--device=/dev/devmm_svm \
+--entrypoint=bash \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/dcmi:/usr/local/dcmi \
+-v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /etc/hccn.conf:/etc/hccn.conf \
+-v /home:/home \
+-v /mnt:/mnt \
+-v /tmp:/tmp \
+-v /data:/data \
+-v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+-e http_proxy="$http_proxy" \
+-e https_proxy="$https_proxy" \
+"${IMAGES_ID}"
+#执行以下命令创建容器
+bash start-docker.sh ac1c767e5aa2 glm5-v0.18.0rc1-a3
+#执行以下命令进入创建完成的容器
+docker exec -it glm5-v0.18.0rc1-a3 bash
+```
+
+启动容器参数说明：
+
+#### 启动推理服务
+
+w8a8量化的模型权重可部署在 1 台Atlas 800 A3（64G×16）上。运行以下脚本以执行在线推理服务。
+```bash
+export HCCL_OP_EXPANSION_MODE="AIV"
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export HCCL_BUFFSIZE=256
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export VLLM_ASCEND_BALANCE_SCHEDULING=1
+vllm serve /data/GLM-5.1-w4a8 \
+--host 0.0.0.0 \
+--port 8077 \
+--data-parallel-size 2 \
+--tensor-parallel-size 8 \
+--enable-expert-parallel \
+--seed 1024 \
+--served-model-name glm-5.1 \
+--max-num-seqs 48 \
+--max-model-len 202752 \
+--max-num-batched-tokens 8192 \
+--trust-remote-code \
+--gpu-memory-utilization 0.92 \
+--quantization ascend \
+--enable-chunked-prefill \
+--enable-prefix-caching \
+--async-scheduling \
+--enable-auto-tool-choice \
+--tool-call-parser glm47 \
+--reasoning-parser glm45 \
+--additional-config '{"enable_npugraph_ex": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":true}' \
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+--speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
+```
+
+环境变量说明：
+启动服务参数说明：
+
+### 双机A2（w4a8）部署指南
+
+#### 在Node0和Node1启动容器
+
+```
+参考2.3.1.1 在所有节点启动容器
+```
+
+#### Node0配置
+
+```
+# node 0
+# this obtained through ifconfig
+# nic_name is the network interface name corresponding to local_ip of the current node
+nic_name="enp61s0f2"
+local_ip="100.100.135.188"
+# The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
+node0_ip="100.100.135.188"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export HCCL_BUFFSIZE=256
+export VLLM_ASCEND_BALANCE_SCHEDULING=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+vllm serve /data/GLM-5.1-w4a8/ \
+--host 0.0.0.0 \
+--port 8077 \
+--data-parallel-size 2 \
+--data-parallel-size-local 1 \
+--data-parallel-address $node0_ip \
+--data-parallel-rpc-port 13389 \
+--tensor-parallel-size 8 \
+--quantization ascend \
+--seed 1024 \
+--served-model-name glm-5.1 \
+--enable-expert-parallel \
+--max-num-seqs 40 \
+--max-model-len 202752 \
+--max-num-batched-tokens 4096 \
+--trust-remote-code \
+--gpu-memory-utilization 0.92 \
+--enable-chunked-prefill \
+--enable-prefix-caching \
+--async-scheduling \
+--enable-auto-tool-choice \
+--tool-call-parser glm47 \
+--reasoning-parser glm45 \
+--additional-config '{"multistream_overlap_shared_expert":true, "fuse_qknorm_rope": false, "fuse_muls_add": true, "enable_npugraph_ex": true}' \
+--compilation-config '{"cudagraph_capture_sizes": [1,4,8,12,16,20,24,28,32,36,40,48,56,64,80,96], "cudagraph_mode": "FULL_DECODE_ONLY"}' \
+--speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
+```
+
+环境变量说明：
+
+启动服务参数说明：
+
+#### Node1配置
+
+```
+# node 1
+# this obtained through ifconfig
+# nic_name is the network interface name corresponding to local_ip of the current node
+nic_name="enp61s0f2"
+local_ip="100.100.135.184"
+# The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
+node0_ip="100.100.135.188"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export HCCL_BUFFSIZE=256
+export VLLM_ASCEND_BALANCE_SCHEDULING=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+vllm serve /data/GLM-5.1-w4a8/ \
+--host 0.0.0.0 \
+--port 8077 \
+--headless \
+--data-parallel-size 2 \
+--data-parallel-size-local 1 \
+--data-parallel-start-rank 1 \
+--data-parallel-address $node0_ip \
+--data-parallel-rpc-port 13389 \
+--tensor-parallel-size 8 \
+--quantization ascend \
+--seed 1024 \
+--served-model-name glm-5.1 \
+--enable-expert-parallel \
+--max-num-seqs 40 \
+--max-model-len 202752 \
+--max-num-batched-tokens 4096 \
+--trust-remote-code \
+--gpu-memory-utilization 0.92 \
+--enable-chunked-prefill \
+--enable-prefix-caching \
+--async-scheduling \
+--enable-auto-tool-choice \
+--tool-call-parser glm47 \
+--reasoning-parser glm45 \
+--additional-config '{"multistream_overlap_shared_expert":true, "fuse_qknorm_rope": false, "fuse_muls_add": true, "enable_npugraph_ex": true}' \
+--compilation-config '{"cudagraph_capture_sizes": [1,4,8,12,16,20,24,28,32,36,40,48,56,64,80,96], "cudagraph_mode": "FULL_DECODE_ONLY"}' \
+--speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
+```
+
+环境变量和Node0一致，参考Node0章节说明。
+相比Node0新增启动参数说明：
+
+
+
+### 双机A3（w8a8）PD混部部署指南
+
+#### 在Node0和Node1启动容器
+
+```
+参考2.3.1.1 在所有节点启动容器
+```
+
+#### Node0配置
+
+```
+# this obtained through ifconfig
+# nic_name is the network interface name corresponding to local_ip of the current node
+nic_name="bond0"
+local_ip="100.100.135.153"
+# The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
+node0_ip="100.100.135.153"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export HCCL_BUFFSIZE=256
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+vllm serve /data/GLM-5.1-w8a8 \
+--host 0.0.0.0 \
+--port 8077 \
+--data-parallel-size 4 \
+--data-parallel-size-local 2 \
+--data-parallel-address $node0_ip \
+--data-parallel-rpc-port 12890 \
+--tensor-parallel-size 8 \
+--seed 1024 \
+--served-model-name glm-5.1 \
+--enable-expert-parallel \
+--max-num-seqs 16 \
+--max-model-len 202752 \
+--max-num-batched-tokens 4096 \
+--trust-remote-code \
+--gpu-memory-utilization 0.92 \
+--quantization ascend \
+--enable-chunked-prefill \
+--enable-prefix-caching \
+--async-scheduling \
+--enable-auto-tool-choice \
+--tool-call-parser glm47 \
+--reasoning-parser glm45 \
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+--additional-config '{"enable_npugraph_ex": true,"fuse_muls_add":true,"multistream_overlap_shared_expert": true }' \
+--speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
+```
+
+环境变量说明：
+
+启动服务参数说明：
+
+#### Node1配置
+
+```
+#
+# this obtained through ifconfig
+# nic_name is the network interface name corresponding to local_ip of the current node
+nic_name="bond0"
+local_ip="100.100.135.154"
+# The value of node0_ip must be consistent with the value of local_ip set in node0 (master node)
+node0_ip="100.100.135.153"
+export HCCL_OP_EXPANSION_MODE="AIV"
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export HCCL_BUFFSIZE=256
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+vllm serve /data/GLM-5.1-w8a8 \
+--host 0.0.0.0 \
+--port 8077 \
+--headless \
+--data-parallel-size 4 \
+--data-parallel-size-local 2 \
+--data-parallel-start-rank 2 \
+--data-parallel-address $node0_ip \
+--data-parallel-rpc-port 12890 \
+--tensor-parallel-size 8 \
+--seed 1024 \
+--served-model-name glm-5.1 \
+--enable-expert-parallel \
+--max-num-seqs 16 \
+--max-model-len 202752 \
+--max-num-batched-tokens 4096 \
+--trust-remote-code \
+--gpu-memory-utilization 0.92 \
+--quantization ascend \
+--enable-chunked-prefill \
+--enable-prefix-caching \
+--async-scheduling \
+--enable-auto-tool-choice \
+--tool-call-parser glm47 \
+--reasoning-parser glm45 \
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+--additional-config '{"enable_npugraph_ex": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":false}' \
+--speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
+```
+
+环境变量和Node0一致，参考Node0章节说明。
+相比Node0新增启动参数说明：
+
+### 四机A3（w8a8）1P1D部署指南
+
+#### 所有节点启动容器
+
+```
+参考2.3.1.1 在所有节点启动容器
+```
+
+#### 所有的节点容器中准备脚本launch_online_dp.py
+
+脚本内容如下，直接拷贝，无需修改：
+```python
+import argparse
+import multiprocessing
+import os
+import subprocess
+import sys
+def parse_args():
+parser = argparse.ArgumentParser()
+parser.add_argument(
+"--dp-size",
+type=int,
+required=True,
+help="Data parallel size."
+)
+parser.add_argument(
+"--tp-size",
+type=int,
+default=1,
+help="Tensor parallel size."
+)
+parser.add_argument(
+"--dp-size-local",
+type=int,
+default=-1,
+help="Local data parallel size."
+)
+parser.add_argument(
+"--dp-rank-start",
+type=int,
+default=0,
+help="Starting rank for data parallel."
+)
+parser.add_argument(
+"--dp-address",
+type=str,
+required=True,
+help="IP address for data parallel master node."
+)
+parser.add_argument(
+"--dp-rpc-port",
+type=str,
+default=12345,
+help="Port for data parallel master node."
+)
+parser.add_argument(
+"--vllm-start-port",
+type=int,
+default=9000,
+help="Starting port for the engine."
+)
+return parser.parse_args()
+args = parse_args()
+dp_size = args.dp_size
+tp_size = args.tp_size
+dp_size_local = args.dp_size_local
+if dp_size_local == -1:
+dp_size_local = dp_size
+dp_rank_start = args.dp_rank_start
+dp_address = args.dp_address
+dp_rpc_port = args.dp_rpc_port
+vllm_start_port = args.vllm_start_port
+def run_command(visible_devices, dp_rank, vllm_engine_port):
+command = [
+"bash",
+"./run_dp_template.sh",
+visible_devices,
+str(vllm_engine_port),
+str(dp_size),
+str(dp_rank),
+dp_address,
+dp_rpc_port,
+str(tp_size),
+]
+subprocess.run(command, check=True)
+if __name__ == "__main__":
+template_path = "./run_dp_template.sh"
+if not os.path.exists(template_path):
+print(f"Template file {template_path} does not exist.")
+sys.exit(1)
+processes = []
+num_cards = dp_size_local * tp_size
+for i in range(dp_size_local):
+dp_rank = dp_rank_start + i
+vllm_engine_port = vllm_start_port + i
+visible_devices = ",".join(str(x) for x in range(i * tp_size, (i + 1) * tp_size))
+process = multiprocessing.Process(target=run_command,
+args=(visible_devices, dp_rank,
+vllm_engine_port))
+processes.append(process)
+process.start()
+for process in processes:
+process.join()
+```
+
+该脚本用于在多机环境中批量启动多个 vLLM 推理实例，以实现数据并行（DP）+ 张量并行（TP）部署。它通过调用 run_dp_template.sh 模板脚本，为每个数据并行 rank 启动一个独立进程，并自动分配 GPU 卡号和服务端口。
+#### 在所有的节点容器中准备部署脚本run_dp_template.sh（各自不同，注意修改）
+
+Prefill1 Node0配置：
+```bash
+nic_name="xxxx" # change to your own nic name
+local_ip="xxxx" # change to your own ip
+export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export HCCL_OP_EXPANSION_MODE="AIV"
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_BUFFSIZE=256
+export ASCEND_AGGREGATE_ENABLE=1
+export ACL_OP_INIT_MODE=1
+export ASCEND_A3_ENABLE=1
+export VLLM_NIXL_ABORT_REQUEST_TIMEOUT=300000
+export ASCEND_RT_VISIBLE_DEVICES=$1
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+vllm serve /data/GLM-5.1-w8a8 \
+--host 0.0.0.0 \
+--port $2 \
+--data-parallel-size $3 \
+--data-parallel-rank $4 \
+--data-parallel-address $5 \
+--data-parallel-rpc-port $6 \
+--tensor-parallel-size $7 \
+--enable-expert-parallel \
+--speculative-config '{"num_speculative_tokens": 3, "method":"deepseek_mtp"}' \
+--seed 1024 \
+--served-model-name glm-5.1 \
+--max-model-len 202752 \
+--additional-config '{"enable_npugraph_ex": true, "fuse_muls_add":true,"multistream_overlap_shared_expert":true,"recompute_scheduler_enable" : true}' \
+--max-num-batched-tokens 4096 \
+--trust-remote-code \
+--max-num-seqs 64 \
+--quantization ascend \
+--gpu-memory-utilization 0.95 \
+--enforce-eager \
+--enable-auto-tool-choice \
+--tool-call-parser glm47 \
+--reasoning-parser glm45 \
+--kv-transfer-config \
+'{"kv_connector": "MooncakeConnectorV1",
+"kv_role": "kv_producer",
+"kv_port": "30000",
+"engine_id": "0",
+"kv_connector_extra_config": {
+"use_ascend_direct": true,
+"prefill": {
+"dp_size": 4,
+"tp_size": 8
+},
+"decode": {
+"dp_size": 8,
+"tp_size": 4
+}
+}
+}'
+```
+
+环境变量说明：
+启动参数说明：
+
+Prefill1 Node1配置：配置与Prefill Node0一致，更换成本机IP和端口，其余配置不变
+```bash
+nic_name="xxxx" # change to your own nic name
+local_ip="xxxx" # change to your own ip
+```
+
+环境变量和启动参数说明（同Prefill的Node0节点）
+
+Decode1 Node0配置：
+```bash
+nic_name="xxxx" # change to your own nic name
+local_ip="xxxx" # change to your own ip
+export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export HCCL_OP_EXPANSION_MODE="AIV"
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+#Mooncake
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_BUFFSIZE=256
+export ASCEND_AGGREGATE_ENABLE=1
+export ASCEND_TRANSPORT_PRINT=1
+export ACL_OP_INIT_MODE=1
+export ASCEND_A3_ENABLE=1
+export VLLM_NIXL_ABORT_REQUEST_TIMEOUT=300000
+export TASK_QUEUE_ENABLE=1
+export ASCEND_RT_VISIBLE_DEVICES=$1
+export VLLM_ASCEND_ENABLE_MLAPO=1
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+vllm serve /data/GLM-5.1-w8a8 \
+--host 0.0.0.0 \
+--port $2 \
+--data-parallel-size $3 \
+--data-parallel-rank $4 \
+--data-parallel-address $5 \
+--data-parallel-rpc-port $6 \
+--tensor-parallel-size $7 \
+--enable-expert-parallel \
+--speculative-config '{"num_speculative_tokens": 3,  "method":"deepseek_mtp"}' \
+--seed 1024 \
+--served-model-name glm-5.1 \
+--max-model-len 202752 \
+--max-num-batched-tokens 32 \
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY", "cudagraph_capture_sizes":[4, 8, 12, 16,20,24,28, 32]}' \
+--additional-config '{"enable_npugraph_ex": true, "fuse_muls_add":true,"multistream_overlap_shared_expert":true,"recompute_scheduler_enable" : true}' \
+--trust-remote-code \
+--max-num-seqs 8 \
+--gpu-memory-utilization 0.92 \
+--async-scheduling \
+--quantization ascend \
+--enable-auto-tool-choice \
+--tool-call-parser glm47 \
+--reasoning-parser glm45 \
+--kv-transfer-config \
+'{"kv_connector": "MooncakeConnectorV1",
+"kv_role": "kv_consumer",
+"kv_port": "30100",
+"engine_id": "1",
+"kv_connector_extra_config": {
+"use_ascend_direct": true,
+"prefill": {
+"dp_size": 4,
+"tp_size": 8
+},
+"decode": {
+"dp_size": 8,
+"tp_size": 4
+}
+}
+}'
+```
+
+Decode1 Node1配置：与Decode1 Node0一致，更换成本机IP和端口，其余配置不变
+```bash
+nic_name="xxxx" # change to your own nic name
+local_ip="xxxx" # change to your own ip
+```
+
+#### 依次在每个节点上启动推理服务
+
+Prefill1 Node0启动，需要修改高亮的：
+```
+python launch_online_dp.py --dp-size 4 --tp-size 8 --dp-size-local 2 --dp-rank-start 0 --dp-address 100.100.135.161 --dp-rpc-port 10521 --vllm-start-port 6789
+```
+
+Prefill1 Node1启动，需要修改高亮的：
+```
+python launch_online_dp.py --dp-size 4 --tp-size 8 --dp-size-local 2 --dp-rank-start 2 --dp-address 100.100.135.161 --dp-rpc-port 10521 --vllm-start-port 6789
+```
+
+Decode1 Node0启动，需要修改高亮的：
+```
+python launch_online_dp.py --dp-size 8 --tp-size 4 --dp-size-local 4 --dp-rank-start 0 --dp-address 100.100.135.165 --dp-rpc-port 10523 --vllm-start-port 6721
+```
+
+Decode1 Node1启动，需要修改高亮的：
+```
+python launch_online_dp.py --dp-size 8 --tp-size 4 --dp-size-local 4 --dp-rank-start 4 --dp-address 100.100.135.165 --dp-rpc-port 10523 --vllm-start-port 6721
+```
+
+在所有节点上观察Application startup complete代表启动成功
+
+
+#### 在一个prefill节点创建proxy脚本load_balance_proxy_server_example.py并启动proxy
+
+脚本内容如下：
+```python
+# Adapted from https://github.com/vllm-project/vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tutorial: Using the Load Balance Proxy Server Example
+#
+# This proxy server is designed to distribute requests between multiple
+# "prefiller" and "decoder" backend servers for large language model inference.
+# It is useful for scaling out inference workloads and balancing load across
+# multiple backend instances.
+#
+# Features:
+# - Load balances requests to multiple prefiller and decoder servers.
+# - Supports OpenAI-compatible /v1/completions and /v1/chat/completions endpoints.
+# - Streams responses from backend servers to clients.
+#
+# Prerequisites:
+# - Python 3.10+
+# - Install dependencies:
+#     pip install fastapi<0.124.0 httpx uvicorn vllm
+#
+# Step 1: Start Your Backend Servers
+# ----------------------------------
+# You need to have at least one prefiller and one decoder backend running.
+# These can be mock servers or actual vLLM servers.
+#
+# For testing, you can use the provided mock server:
+#
+#   vllm serve --host 0.0.0.0 --port 8100 ... # Prefiller 1
+#   vllm serve --host 0.0.0.0 --port 8101 ... # Prefiller 2
+#   vllm serve --host 0.0.0.0 --port 8200 ... # Decoder 1
+#   vllm serve --host 0.0.0.0 --port 8201 ... # Decoder 2
+#
+# Step 2: Start the Proxy Server
+# ------------------------------
+# Run the proxy server, specifying the host/port for each prefiller and decoder:
+#
+#   python load_balance_proxy_server_example.py \
+#     --host 0.0.0.0 --port 9000 \
+#     --prefiller-hosts 127.0.0.1 127.0.0.1 \
+#     --prefiller-ports 8100 8101 \
+#     --decoder-hosts 127.0.0.1 127.0.0.1 \
+#     --decoder-ports 8200 8201
+#
+# This will start the proxy on port 9000, load balancing between two prefiller
+# and two decoder servers.
+#
+# Step 3: Send a Request to the Proxy
+# -----------------------------------
+# You can now send OpenAI-compatible requests to the proxy. For example:
+#
+#   curl -X POST http://localhost:9000/v1/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#           "model": "your-model",
+#           "prompt": "The quick brown fox jumps over the lazy dog",
+#           "max_tokens": 16
+#         }'
+#
+# Or for chat completions:
+#
+#   curl -X POST http://localhost:9000/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#           "model": "your-model",
+#           "messages": [{"role": "user", "content": "Hello!"}],
+#           "max_tokens": 16
+#         }'
+#
+# Step 4: Health Check
+# --------------------
+# To check if the proxy is running and see how many backend instances are
+# connected, use:
+#
+#   curl http://localhost:9000/healthcheck
+#
+# This will return a JSON object with the status and the number of prefiller
+# and decoder instances.
+#
+# Step 5: Add or Remove Prefiller or Decoder Instances (Optional)
+# ---------------------------------------------------------------
+# You can add or remove prefiller or decoder instances after the proxy is started.
+# For example, add 2 prefiller instances:
+#
+#   curl -X POST http://localhost:9000/instances/add \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#           "type": "prefill",
+#           "instances": ["127.0.0.1:8102", "127.0.0.1:8103"]
+#         }'
+#
+# or remove 1 decoder instance:
+#
+#   curl -X POST http://localhost:9000/instances/remove \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#           "type": "decode",
+#           "instances": "127.0.0.1:8201"
+#         }'
+#
+# This will return a JSON object with the adding or removing info
+# and the current prefiller and decoder instances.
+#
+# When adding instances, if the instances are not started,
+# the proxy will wait and try until the instances to be started
+# or exceeding the number of attempts
+#
+# Notes:
+# - You can scale the number of prefiller and decoder servers as needed.
+# - The proxy will round-robin requests to balance load.
+# - For production, ensure your backend servers are robust and secure.
+#
+# For more details, see the code and comments in this file.
+import argparse
+import asyncio
+import functools
+import heapq
+import ipaddress
+import json
+import os
+import sys
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+try:
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+except ImportError:
+import logging
+logger = logging.getLogger(__name__)
+# Add uvloop for faster event loop if available
+try:
+import uvloop
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+pass
+@dataclass
+class InstanceType:
+PREFILL: str = "prefill"
+DECODE: str = "decode"
+TAINT_PRIORITY = 1e15
+class ServerState:
+def __init__(self, host, port):
+self.host = host
+self.port = port
+self.url = f"http://{host}:{port}/v1"
+try:
+ip = ipaddress.ip_address(self.host)
+if isinstance(ip, ipaddress.IPv6Address):
+self.url = f"http://[{host}]:{port}/v1"
+except Exception:
+pass
+self.client = httpx.AsyncClient(
+timeout=None,
+base_url=self.url,
+limits=httpx.Limits(max_connections=100000, max_keepalive_connections=100000),
+)
+self.active_tokens = 0
+self.active_kv_cache = 0  # Only for prefiller
+self.active_requests = 0  # Number of active requests
+self.aborted_requests = set()  # Track aborted requests
+# Removed individual server lock - will use global locks instead
+def __eq__(self, other):
+self_host = self.host.replace("localhost", "0.0.0.0").replace("127.0.0.1", "0.0.0.0")
+other_host = other.host.replace("localhost", "0.0.0.0").replace("127.0.0.1", "0.0.0.0")
+return self_host == other_host and str(self.port) == str(other.port)
+def __hash__(self):
+self_host = self.host.replace("localhost", "0.0.0.0").replace("127.0.0.1", "0.0.0.0")
+return hash((self_host, str(self.port)))
+def __repr__(self):
+return f"{self.host}:{self.port}"
+class ProxyState:
+def __init__(self, prefiller_instances, decoder_instances):
+self.request_num = 0
+self.tainted_prefillers: list[ServerState] = []
+self.tainted_decoders: list[ServerState] = []
+self.node_listener = NodeListener(self)
+self.prefillers: list[ServerState] = [ServerState(h, p) for h, p in prefiller_instances]
+self.decoders: list[ServerState] = [ServerState(h, p) for h, p in decoder_instances]
+self.req_to_prefiller = {}
+self.req_id_lock = asyncio.Lock()
+# Removed selection locks - no longer needed for synchronous methods
+# Initialize priority queues for efficient server selection
+# Each entry is (priority_score, server_index, server_reference)
+# Lower priority score = higher priority (less loaded)
+self.prefiller_heap = [(0.0, i, server) for i, server in enumerate(self.prefillers)]
+self.decoder_heap = [(0.0, i, server) for i, server in enumerate(self.decoders)]
+heapq.heapify(self.prefiller_heap)
+heapq.heapify(self.decoder_heap)
+def _update_prefiller_priority(self, server_idx: int):
+"""Update the priority of a prefiller server in the heap."""
+server = self.prefillers[server_idx]
+# Priority based on active_tokens and active_kv_cache
+priority = server.active_tokens + server.active_kv_cache * 0.3
+# Remove old entry and add new one
+self.prefiller_heap = [(p, i, s) for p, i, s in self.prefiller_heap if i != server_idx]
+heapq.heappush(self.prefiller_heap, (priority, server_idx, server))
+def _update_decoder_priority(self, server_idx: int):
+"""Update the priority of a decoder server in the heap."""
+server = self.decoders[server_idx]
+priority = server.active_tokens
+# Remove old entry and add new one
+self.decoder_heap = [(p, i, s) for p, i, s in self.decoder_heap if i != server_idx]
+heapq.heappush(self.decoder_heap, (priority, server_idx, server))
+def abort_prefiller_request(self, server_idx: int, request_id):  # Changed to synchronous
+"""
+Mark a request as aborted. This will helps to release kv cache in
+prefiller node.
+"""
+# No lock needed - atomic operation
+if server_idx >= len(self.prefillers):
+return
+self.prefillers[server_idx].aborted_requests.add(request_id)
+def acquire_aborted_prefiller_requests(self, server_idx: int):  # Changed to synchronous
+"""
+Get the set of aborted requests and clear it.
+This is used to release kv cache in prefiller node.
+"""
+# No lock needed - atomic operation
+if server_idx >= len(self.prefillers):
+return set()
+aborted_requests = self.prefillers[server_idx].aborted_requests.copy()
+self.prefillers[server_idx].aborted_requests.clear()
+return aborted_requests
+async def next_req_id(self):
+async with self.req_id_lock:
+return str(uuid.uuid4())
+def select_prefiller(self, token_count):  # Changed to synchronous
+# No lock needed - entire function is atomic
+if not self.prefiller_heap:
+raise RuntimeError("No prefiller servers available")
+priority, chosen, server = heapq.heappop(self.prefiller_heap)
+# Update the chosen server atomically
+self.prefillers[chosen].active_tokens += token_count
+self.prefillers[chosen].active_kv_cache += token_count
+# Update priority and re-add to heap
+self._update_prefiller_priority(chosen)
+return chosen
+def release_prefiller(self, idx, token_count):  # Changed to synchronous
+# No lock needed - atomic operation
+if idx >= len(self.prefillers):
+return
+self.prefillers[idx].active_tokens -= token_count
+# Update priority queue after releasing
+self._update_prefiller_priority(idx)
+def release_prefiller_kv(self, idx, token_count):  # Changed to synchronous
+# No lock needed - atomic operation
+if idx >= len(self.prefillers):
+return
+if self.prefillers[idx].active_kv_cache > 0:
+self.prefillers[idx].active_kv_cache -= token_count
+# Update priority queue after releasing
+self._update_prefiller_priority(idx)
+def select_decoder(self, token_count):  # Changed to synchronous
+# No lock needed - entire function is atomic
+if not self.decoder_heap:
+raise RuntimeError("No decoder servers available")
+priority, chosen, server = heapq.heappop(self.decoder_heap)
+# Update the chosen server atomically
+self.decoders[chosen].active_tokens += token_count
+# Update priority and re-add to heap
+self._update_decoder_priority(chosen)
+return chosen
+def release_decoder(self, idx, token_count):  # Changed to synchronous
+# No lock needed - atomic operation
+if idx >= len(self.decoders):
+return
+self.decoders[idx].active_tokens -= token_count
+# Update priority queue after releasing
+self._update_decoder_priority(idx)
+# Omni_infer's calculate_input_scores function
+def calculate_prefill_scores(self, request_length: int) -> float:
+length_score = request_length / 4.0
+input_score = length_score * 0.0345 + 120.0745
+return input_score
+def calculate_decode_scores(self, request_length: int) -> float:
+return request_length
+async def add_instances(self, instance_type: str, instances: list[ServerState]) -> tuple[list[str], list[str]]:
+added_nodes, waiting_nodes = [], []
+for server in instances:
+is_valid = await self.node_listener.check_instance_status(server.client)
+if is_valid and instance_type == InstanceType.PREFILL:
+self.add_prefillers([server])
+added_nodes.append(str(server))
+elif is_valid and instance_type == InstanceType.DECODE:
+self.add_decoders([server])
+added_nodes.append(str(server))
+else:
+node = str(server)
+self.node_listener.waiting_nodes[node] = (instance_type, server, 0)
+waiting_nodes.append(node)
+return added_nodes, waiting_nodes
+def add_prefillers(self, instances: list[ServerState]) -> None:
+for server in instances:
+if server in self.tainted_prefillers:
+self.tainted_prefillers.remove(server)
+self.prefiller_heap = [
+(0, idx, server) if srv == server else (priority, idx, srv)
+for priority, idx, srv in self.prefiller_heap
+]
+heapq.heapify(self.prefiller_heap)
+elif server not in self.prefillers:
+self.prefillers.append(server)
+# prefiller_heap: [(priority_0, 0, server_0)] -> [(priority_0, 0, server_0), (0, 1, server_1)]
+heapq.heappush(self.prefiller_heap, (0, len(self.prefillers) - 1, server))
+self.print_status(f"Add prefiller instances: {instances}.")
+def add_decoders(self, instances: list[ServerState]) -> None:
+for server in instances:
+if server in self.tainted_decoders:
+self.tainted_decoders.remove(server)
+self.decoder_heap = [
+(0, idx, server) if srv == server else (priority, idx, srv)
+for priority, idx, srv in self.decoder_heap
+]
+heapq.heapify(self.decoder_heap)
+elif server not in self.decoders:
+self.decoders.append(server)
+# decoder_heap: [(priority_0, 0, server_0)] -> [(priority_0, 0, server_0), (0, 1, server_1)]
+heapq.heappush(self.decoder_heap, (0, len(self.decoders) - 1, server))
+self.print_status(f"Add decoder instances: {instances}.")
+def remove_prefillers(self, instances: list[ServerState]) -> bool:
+if not instances:
+return False
+if self.request_num > 0:
+logger.warning(f"Start to taint prefill instances {instances}.")
+self._taint_prefillers(instances)
+return True
+instances_to_remove = set(instances)
+self.prefillers = [server for server in self.prefillers if server not in instances_to_remove]
+prefiller_heap_copy = self.prefiller_heap.copy()
+prefiller_heap_copy.sort(key=lambda x: x[1])  # sorted by key: prefiller_idx
+prefiller_heap = []
+idx = 0
+for priority, _, server in prefiller_heap_copy:
+if server not in instances_to_remove:
+prefiller_heap.append((priority, idx, server))
+idx += 1
+# prefiller_heap: [(priority_0, 0, server_0), (priority_1, 1, server_1)] -> [(priority_1, 0, server_1)]
+self.prefiller_heap = prefiller_heap
+heapq.heapify(self.prefiller_heap)
+self.print_status(f"Remove prefiller instances: {instances}.")
+return False
+def remove_decoders(self, instances: list[ServerState]) -> bool:
+if not instances:
+return False
+if self.request_num > 0:
+logger.warning(f"Start to taint decode instances {instances}.")
+self._taint_decoders(instances)
+return True
+instances_to_remove = set(instances)
+self.decoders = [server for server in self.decoders if server not in instances_to_remove]
+decoder_heap_copy = self.decoder_heap.copy()
+decoder_heap_copy.sort(key=lambda x: x[1])  # sorted by key: decoder_idx
+decoder_heap = []
+idx = 0
+for priority, _, server in decoder_heap_copy:
+if server not in instances_to_remove:
+decoder_heap.append((priority, idx, server))
+idx += 1
+# decoder_heap: [(priority_0, 0, server_0), (priority_1, 1, server_1)] -> [(priority_1, 0, server_1)]
+self.decoder_heap = decoder_heap
+heapq.heapify(self.decoder_heap)
+self.print_status(f"Remove decoder instances: {instances}.")
+return False
+def _taint_prefillers(self, instances: list[ServerState]) -> None:
+instances_to_taint = set(instances)
+for server in self.prefillers:
+if server in instances_to_taint and server not in self.tainted_prefillers:
+self.tainted_prefillers.append(server)
+self.prefiller_heap = [
+(TAINT_PRIORITY, idx, srv) if srv in instances_to_taint else (priority, idx, srv)
+for priority, idx, srv in self.prefiller_heap
+]
+heapq.heapify(self.prefiller_heap)
+def _taint_decoders(self, instances: list[ServerState]) -> None:
+instances_to_taint = set(instances)
+for server in self.decoders:
+if server in instances_to_taint and server not in self.tainted_decoders:
+self.tainted_decoders.append(server)
+self.decoder_heap = [
+(TAINT_PRIORITY, idx, srv) if srv in instances_to_taint else (priority, idx, srv)
+for priority, idx, srv in self.decoder_heap
+]
+heapq.heapify(self.decoder_heap)
+def print_status(self, msg: str) -> None:
+status = {
+"prefill_instances": [str(server) for server in self.prefillers],
+"decode_instances": [str(server) for server in self.decoders],
+}
+print(f"{msg} Status: {status}")
+proxy_state = None
+class NodeListener:
+def __init__(self, proxy):
+self.proxy_state = proxy
+self.waiting_nodes: dict[str, tuple[str, Any, int]] = {}
+self.listening_thread = threading.Thread(target=self._node_listener, daemon=True)
+self.listening_thread.start()
+def _node_listener(self) -> None:
+while True:
+for node, (instance_type, server, check_times) in list(self.waiting_nodes.items()):
+is_valid = asyncio.run(self.check_instance_status(server.client))
+print(f"Checking instance {node}...")
+check_times += 1
+if is_valid:
+if instance_type == InstanceType.PREFILL:
+self.proxy_state.add_prefillers([server])
+else:
+self.proxy_state.add_decoders([server])
+self.waiting_nodes.pop(node)
+elif check_times == global_args.max_waiting_retries:
+print(f"Instance {node} was not added to the proxy.")
+self.waiting_nodes.pop(node)
+else:
+self.waiting_nodes[node] = (instance_type, server, check_times)
+if self.proxy_state.tainted_prefillers and not self.proxy_state.request_num:
+need_waiting = self.proxy_state.remove_prefillers(self.proxy_state.tainted_prefillers)
+if not need_waiting:
+self.proxy_state.tainted_prefillers.clear()
+if self.proxy_state.tainted_decoders and not self.proxy_state.request_num:
+need_waiting = self.proxy_state.remove_decoders(self.proxy_state.tainted_decoders)
+if not need_waiting:
+self.proxy_state.tainted_decoders.clear()
+time.sleep(global_args.waiting_retry_interval)
+@staticmethod
+async def check_instance_status(client: httpx.AsyncClient) -> bool:
+endpoint = "/models"
+headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+try:
+response = await client.get(endpoint, headers=headers)
+response.raise_for_status()
+return True
+except (httpx.RequestError, httpx.HTTPStatusError):
+return False
+def parse_args():
+parser = argparse.ArgumentParser()
+parser.add_argument("--port", type=int, default=8000)
+parser.add_argument("--host", type=str, default="localhost")
+parser.add_argument("--prefiller-hosts", type=str, nargs="+", default=["localhost"])
+parser.add_argument("--prefiller-ports", type=int, nargs="+", default=[8001])
+parser.add_argument("--decoder-hosts", type=str, nargs="+", default=["localhost"])
+parser.add_argument("--decoder-ports", type=int, nargs="+", default=[8002])
+parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries for HTTP requests")
+parser.add_argument(
+"--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
+)
+parser.add_argument(
+"--max-waiting-retries", type=int, default=3, help="Maximum number of retries for waiting nodes to be started"
+)
+parser.add_argument(
+"--waiting-retry-interval",
+type=float,
+default=10,
+help="Check interval (seconds) for waiting nodes to be started",
+)
+args = parser.parse_args()
+if len(args.prefiller_hosts) != len(args.prefiller_ports):
+raise ValueError("Number of prefiller hosts must match number of prefiller ports")
+if len(args.decoder_hosts) != len(args.decoder_ports):
+raise ValueError("Number of decoder hosts must match number of decoder ports")
+args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
+args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
+return args
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+global proxy_state
+proxy_state = ProxyState(global_args.prefiller_instances, global_args.decoder_instances)
+print(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
+yield
+for p in proxy_state.prefillers:
+await p.client.aclose()
+for d in proxy_state.decoders:
+await d.client.aclose()
+async def listen_for_disconnect(request: Request) -> None:
+"""Return if a disconnect message is received"""
+while True:
+message = await request.receive()
+if message["type"] == "http.disconnect":
+break
+def with_cancellation(handler_func):
+@functools.wraps(handler_func)
+async def wrapper(*args, **kwargs):
+request = kwargs["request"]
+handler_task = asyncio.create_task(handler_func(*args, **kwargs))
+cancellation_task = asyncio.create_task(listen_for_disconnect(request))
+done, pending = await asyncio.wait([handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED)
+for task in pending:
+task.cancel()
+if handler_task in done:
+return handler_task.result()
+return None
+return wrapper
+app = FastAPI(lifespan=lifespan)
+async def send_request_to_service(
+client: httpx.AsyncClient,
+prefiller_id: int,
+endpoint: str,
+req_data: dict,
+request_id: str,
+max_retries: int = 3,
+base_delay: float = 0.2,
+):
+aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
+req_data = req_data.copy()
+req_data["kv_transfer_params"] = {
+"do_remote_decode": True,
+"do_remote_prefill": False,
+"remote_engine_id": None,
+"remote_block_ids": None,
+"remote_host": None,
+"remote_port": None,
+"aborted_request": list(aborted_requests),
+}
+req_data["stream"] = False
+req_data["max_tokens"] = 1
+req_data["min_tokens"] = 1
+if "max_completion_tokens" in req_data:
+req_data["max_completion_tokens"] = 1
+if "stream_options" in req_data:
+del req_data["stream_options"]
+headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
+last_exc = None
+for attempt in range(1, max_retries + 1):
+try:
+response = await client.post(endpoint, json=req_data, headers=headers)
+response.raise_for_status()
+return response
+except (httpx.RequestError, httpx.HTTPStatusError) as e:
+logger.warning(f"Attempt {attempt} failed for {endpoint}: {str(e)}")
+last_exc = e
+if attempt < max_retries:
+await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+else:
+logger.error(f"All {max_retries} attempts failed for {endpoint}.")
+raise last_exc
+async def stream_service_response_with_retry(
+client: httpx.AsyncClient,
+endpoint: str,
+req_data: dict,
+request_id: str,
+max_retries: int = 3,
+base_delay: float = 0.2,
+):
+headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
+for attempt in range(1, max_retries + 1):
+try:
+async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
+response.raise_for_status()
+first_chunk_sent = False
+async for chunk in response.aiter_bytes():
+first_chunk_sent = True
+yield chunk
+return  # Success, exit after streaming
+except (httpx.RequestError, httpx.HTTPStatusError) as e:
+if attempt < max_retries:
+logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
+await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+else:
+logger.error(f"All {max_retries} attempts failed for streaming {endpoint}.")
+raise e
+except Exception as e:
+# If any chunk has been sent, do not retry, just log and drop
+if "first_chunk_sent" in locals() and first_chunk_sent:
+logger.error(f"Streaming to client interrupted after response started: {str(e)}")
+return
+else:
+if attempt < max_retries:
+logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
+await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+else:
+logger.error(f"All {max_retries} attempts failed for streaming {endpoint}.")
+raise e
+async def _handle_select_instance(api: str, req_data: Any, request_length: int):
+prefiller_score = proxy_state.calculate_prefill_scores(request_length)
+logger.debug(f"Request length: {request_length}, Prefiller score: {prefiller_score}")
+request_id = await proxy_state.next_req_id()
+# Select prefiller
+prefiller_idx = proxy_state.select_prefiller(prefiller_score)
+prefiller = proxy_state.prefillers[prefiller_idx]
+# Send request to prefiller
+response = await send_request_to_service(
+prefiller.client,
+prefiller_idx,
+api,
+req_data,
+request_id,
+max_retries=global_args.max_retries,
+base_delay=global_args.retry_delay,
+)
+proxy_state.release_prefiller(prefiller_idx, prefiller_score)
+response_json = response.json()
+kv_transfer_params = response_json.get("kv_transfer_params", {})
+if kv_transfer_params:
+req_data["kv_transfer_params"] = kv_transfer_params
+# Select decoder
+decoder_score = proxy_state.calculate_decode_scores(request_length)
+logger.debug("Decoder score: %f", decoder_score)
+# Use the prefiller's kv_transfer_params to select decoder
+decoder_idx = proxy_state.select_decoder(decoder_score)
+decoder = proxy_state.decoders[decoder_idx]
+logger.debug("Using %s %s", prefiller.url, decoder.url)
+return InstanceInfo(
+request_id=request_id,
+prefiller_idx=prefiller_idx,
+prefiller_score=prefiller_score,
+prefiller=prefiller,
+decoder=decoder,
+decoder_idx=decoder_idx,
+decoder_score=decoder_score,
+)
+@dataclass
+class InstanceInfo:
+request_id: str
+prefiller_idx: int
+prefiller_score: float
+prefiller: ServerState
+decoder_idx: int
+decoder_score: float
+decoder: ServerState
+async def _handle_completions(api: str, request: Request):
+try:
+proxy_state.request_num += 1
+req_data = await request.json()
+req_body = await request.body()
+request_length = len(req_body)
+instance_info = await _handle_select_instance(api, req_data, request_length)
+stream_flag = bool(req_data.get("stream", False))
+chat_flag = "messages" in req_data
+if "prompt" in req_data:
+origin_prompt = req_data["prompt"]
+elif chat_flag:
+messages = req_data["messages"]
+origin_prompt = messages[0].get("content", "")
+else:
+origin_prompt = ""
+# refer to vLLM sampling_params: max_token default value
+origin_max_tokens = req_data.get("max_tokens", 16)
+async def generate_stream():
+nonlocal instance_info
+generated_token = ""
+released_kv = False
+retry_count = 0
+retry = True
+completion_tokens = 0
+# Only one await per chunk, minimal logic in loop
+try:
+while retry:
+retry = False
+async for chunk in stream_service_response_with_retry(
+instance_info.decoder.client,
+api,
+req_data,
+request_id=instance_info.request_id,
+max_retries=global_args.max_retries,
+base_delay=global_args.retry_delay,
+):
+if not released_kv and chunk:
+proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
+released_kv = True
+try:
+chunk_str = chunk.decode("utf-8").strip()
+except UnicodeDecodeError:
+logger.debug(f"Skipping chunk: {chunk}")
+yield chunk
+continue
+if not chunk_str:
+continue
+if chunk_str.startswith("data: "):
+chunk_str = chunk_str[len("data: ") :]
+try:
+chunk_json = json.loads(chunk_str)
+except json.JSONDecodeError:
+# if chunk is [done], skip it.
+logger.debug(f"Skipping chunk: {chunk_str}")
+yield chunk
+continue
+choices = chunk_json.get("choices", [])
+if not choices:
+yield chunk
+continue
+choice = choices[0]
+delta = choice.get("delta") or {}
+message = choice.get("message") or {}
+content = delta.get("content") or message.get("content") or choice.get("text") or ""
+generated_token += content
+stop_reason = choice.get("stop_reason")
+usage = chunk_json.get("usage", {})
+completion_tokens = (
+(completion_tokens + 1)
+if stream_flag
+else (completion_tokens + usage.get("completion_tokens"))
+)
+if stop_reason == "recomputed":
+retry = True
+retry_count += 1
+if chat_flag:
+messages[0]["content"] = origin_prompt + generated_token
+else:
+req_data["prompt"] = origin_prompt + generated_token
+req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
+tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
+instance_info = await _handle_select_instance(api, req_data, tmp_request_length)
+break
+if retry_count > 0 and not stream_flag:
+if chat_flag:
+choice["message"]["content"] = generated_token
+else:
+choice["text"] = generated_token
+chunk = json.dumps(chunk_json).encode("utf-8")
+yield chunk
+except Exception as e:
+logger.error(
+f"Error during streaming from decoder {instance_info.decoder.url}: {str(e)} "
+f"the aborted request {instance_info.request_id} will be routing to the target "
+"prefiller when new request is ready to dispatch to it"
+)
+proxy_state.abort_prefiller_request(instance_info.prefiller_idx, instance_info.request_id)
+proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
+# After streaming done, release tokens
+proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
+# Determine the correct media type based on stream flag
+media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
+return StreamingResponse(generate_stream(), media_type=media_type)
+except Exception as e:
+import traceback
+exc_info = sys.exc_info()
+print(f"Error occurred in disagg prefill proxy server - {api} endpoint")
+print(e)
+print("".join(traceback.format_exception(*exc_info)))
+raise
+finally:
+proxy_state.request_num -= 1
+async def _handle_adjust_instances(adjust_mode: str, request: Request):
+try:
+req_data = await request.json()
+instance_type = req_data.get("type", "")
+instances = req_data.get("instances", [])
+if isinstance(instances, str):
+instances = [instances]
+instances = trans_instances(instances)
+all_msg = f"{adjust_mode} {instance_type} instances: {[str(server) for server in instances]}."
+if instance_type not in [InstanceType.PREFILL, InstanceType.DECODE]:
+return {
+"error": f"Instance type {instance_type} is not supported. "
+f"Only support '{InstanceType.PREFILL}' and '{InstanceType.DECODE}'."
+}
+if adjust_mode == "add":
+added_nodes, waiting_nodes = await proxy_state.add_instances(instance_type, instances)
+if waiting_nodes:
+all_msg = (
+f"{adjust_mode} {instance_type} instances: {added_nodes}. "
+f"Instances {waiting_nodes} are waiting to be added."
+)
+elif adjust_mode == "remove":
+if instance_type == InstanceType.PREFILL:
+need_waiting = proxy_state.remove_prefillers(instances)
+else:
+need_waiting = proxy_state.remove_decoders(instances)
+if need_waiting:
+all_msg = f"Instances {instances} are isolated and waiting to be removed."
+return {
+"message": all_msg,
+"current_prefill_instances": [str(prefiller) for prefiller in proxy_state.prefillers],
+"current_decode_instances": [str(decoder) for decoder in proxy_state.decoders],
+}
+except Exception as e:
+logger.error(f"Failed to {adjust_mode} instances: {e}")
+raise e
+def trans_instances(instances: list[str]) -> list[ServerState]:
+server_list = []
+for instance in instances:
+h, p = instance.split(":")
+server_list.append(ServerState(h, int(p)))
+return server_list
+@app.post("/v1/completions")
+@with_cancellation
+async def handle_completions(request: Request):
+return await _handle_completions("/completions", request)
+@app.post("/v1/chat/completions")
+@with_cancellation
+async def handle_chat_completions(request: Request):
+return await _handle_completions("/chat/completions", request)
+@app.get("/healthcheck")
+async def healthcheck():
+return {
+"status": "ok",
+"prefill_instances": len(proxy_state.prefillers),
+"decode_instances": len(proxy_state.decoders),
+}
+@app.post("/instances/add")
+async def handle_add_instances(request: Request):
+return await _handle_adjust_instances("add", request)
+@app.post("/instances/remove")
+async def handle_remove_instances(request: Request):
+return await _handle_adjust_instances("remove", request)
+if __name__ == "__main__":
+global global_args
+global_args = parse_args()
+import uvicorn
+uvicorn.run(app, host=global_args.host, port=global_args.port)
+```
+
+#### 通过proxy对外提供服务ip和端口
+
+```
+unset http_proxy
+unset https_proxy
+python load_balance_proxy_server_example.py \
+--port 1999 \
+--host 0.0.0.0 \
+--prefiller-hosts \
+"100.100.135.161" \
+"100.100.135.161" \
+"100.100.135.163" \
+"100.100.135.163" \
+--prefiller-ports \
+6789 6790\
+6789 6790\
+--decoder-hosts \
+"100.100.135.165" \
+"100.100.135.165" \
+"100.100.135.165" \
+"100.100.135.165" \
+"100.100.135.166" \
+"100.100.135.166" \
+"100.100.135.166" \
+"100.100.135.166" \
+--decoder-ports \
+6721 6722 6723 6724\
+6721 6722 6723 6724
+```
+
+### 六机A3（w8a8）1P1D分离部署指南
+
+```
+参考2.3.1.1 在所有节点启动容器
+```
+
+#### 所有的节点容器中准备脚本launch_online_dp.py
+
+脚本内容如下，直接拷贝，无需修改：
+```python
+import argparse
+import multiprocessing
+import os
+import subprocess
+import sys
+def parse_args():
+parser = argparse.ArgumentParser()
+parser.add_argument(
+"--dp-size",
+type=int,
+required=True,
+help="Data parallel size."
+)
+parser.add_argument(
+"--tp-size",
+type=int,
+default=1,
+help="Tensor parallel size."
+)
+parser.add_argument(
+"--dp-size-local",
+type=int,
+default=-1,
+help="Local data parallel size."
+)
+parser.add_argument(
+"--dp-rank-start",
+type=int,
+default=0,
+help="Starting rank for data parallel."
+)
+parser.add_argument(
+"--dp-address",
+type=str,
+required=True,
+help="IP address for data parallel master node."
+)
+parser.add_argument(
+"--dp-rpc-port",
+type=str,
+default=12345,
+help="Port for data parallel master node."
+)
+parser.add_argument(
+"--vllm-start-port",
+type=int,
+default=9000,
+help="Starting port for the engine."
+)
+return parser.parse_args()
+args = parse_args()
+dp_size = args.dp_size
+tp_size = args.tp_size
+dp_size_local = args.dp_size_local
+if dp_size_local == -1:
+dp_size_local = dp_size
+dp_rank_start = args.dp_rank_start
+dp_address = args.dp_address
+dp_rpc_port = args.dp_rpc_port
+vllm_start_port = args.vllm_start_port
+def run_command(visible_devices, dp_rank, vllm_engine_port):
+command = [
+"bash",
+"./run_dp_template.sh",
+visible_devices,
+str(vllm_engine_port),
+str(dp_size),
+str(dp_rank),
+dp_address,
+dp_rpc_port,
+str(tp_size),
+]
+subprocess.run(command, check=True)
+if __name__ == "__main__":
+template_path = "./run_dp_template.sh"
+if not os.path.exists(template_path):
+print(f"Template file {template_path} does not exist.")
+sys.exit(1)
+processes = []
+num_cards = dp_size_local * tp_size
+for i in range(dp_size_local):
+dp_rank = dp_rank_start + i
+vllm_engine_port = vllm_start_port + i
+visible_devices = ",".join(str(x) for x in range(i * tp_size, (i + 1) * tp_size))
+process = multiprocessing.Process(target=run_command,
+args=(visible_devices, dp_rank,
+vllm_engine_port))
+processes.append(process)
+process.start()
+for process in processes:
+process.join()
+```
+
+该脚本用于在多机环境中批量启动多个 vLLM 推理实例，以实现数据并行（DP）+ 张量并行（TP）部署。它通过调用 run_dp_template.sh 模板脚本，为每个数据并行 rank 启动一个独立进程，并自动分配 GPU 卡号和服务端口。
+#### 在所有的节点容器中准备部署脚本run_dp_template.sh（各自不同，注意修改）
+
+Prefill1 Node0配置：
+```bash
+nic_name="xxxx" # change to your own nic name
+local_ip="xxxx" # change to your own ip
+export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export HCCL_OP_EXPANSION_MODE="AIV"
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_BUFFSIZE=256
+export ASCEND_AGGREGATE_ENABLE=1
+export ASCEND_TRANSPORT_PRINT=1
+export ACL_OP_INIT_MODE=1
+export ASCEND_A3_ENABLE=1
+export VLLM_NIXL_ABORT_REQUEST_TIMEOUT=300000
+export ASCEND_RT_VISIBLE_DEVICES=$1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+vllm serve /data/GLM-5.1-w8a8 \
+--host 0.0.0.0 \
+--port $2 \
+--data-parallel-size $3 \
+--data-parallel-rank $4 \
+--data-parallel-address $5 \
+--data-parallel-rpc-port $6 \
+--tensor-parallel-size $7 \
+--enable-expert-parallel \
+--speculative-config '{"num_speculative_tokens": 3, "method":"deepseek_mtp"}' \
+--seed 1024 \
+--served-model-name glm-5.1 \
+--max-model-len 202752 \
+--additional-config '{"enable_npugraph_ex": true, "fuse_muls_add":true,"multistream_overlap_shared_expert":true,"recompute_scheduler_enable" : true}' \
+--max-num-batched-tokens 4096 \
+--trust-remote-code \
+--max-num-seqs 64 \
+--gpu-memory-utilization 0.95 \
+--quantization ascend \
+--enforce-eager \
+--enable-auto-tool-choice \
+--tool-call-parser glm47 \
+--reasoning-parser glm45 \
+--kv-transfer-config \
+'{"kv_connector": "MooncakeConnectorV1",
+"kv_role": "kv_producer",
+"kv_port": "30000",
+"engine_id": "0",
+"kv_connector_extra_config": {
+"use_ascend_direct": true,
+"prefill": {
+"dp_size": 4,
+"tp_size": 8
+},
+"decode": {
+"dp_size": 16,
+"tp_size": 4
+}
+}
+}'
+```
+
+环境变量说明：
+启动参数说明：
+
+Prefill1 Node1配置：配置与Prefill Node0一致，更换成本机IP和端口，其余配置不变
+```bash
+nic_name="xxxx" # change to your own nic name
+local_ip="xxxx" # change to your own ip
+```
+
+环境变量和启动参数说明（同Prefill的Node0节点）
+
+Decode1 Node0配置：
+```bash
+nic_name="xxxx" # change to your own nic name
+local_ip="xxxx" # change to your own ip
+export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export HCCL_OP_EXPANSION_MODE="AIV"
+export HCCL_IF_IP=$local_ip
+export GLOO_SOCKET_IFNAME=$nic_name
+export TP_SOCKET_IFNAME=$nic_name
+export HCCL_SOCKET_IFNAME=$nic_name
+#Mooncake
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_BUFFSIZE=256
+export ASCEND_AGGREGATE_ENABLE=1
+export ASCEND_TRANSPORT_PRINT=1
+export ACL_OP_INIT_MODE=1
+export ASCEND_A3_ENABLE=1
+export VLLM_NIXL_ABORT_REQUEST_TIMEOUT=300000
+export TASK_QUEUE_ENABLE=1
+export ASCEND_RT_VISIBLE_DEVICES=$1
+export VLLM_ASCEND_ENABLE_MLAPO=1
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+vllm serve /data/GLM-5.1-w8a8 \
+--host 0.0.0.0 \
+--port $2 \
+--data-parallel-size $3 \
+--data-parallel-rank $4 \
+--data-parallel-address $5 \
+--data-parallel-rpc-port $6 \
+--tensor-parallel-size $7 \
+--enable-expert-parallel \
+--speculative-config '{"num_speculative_tokens": 3,  "method":"deepseek_mtp"}' \
+--seed 1024 \
+--served-model-name glm-5.1 \
+--max-model-len 202752 \
+--max-num-batched-tokens 32 \
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY", "cudagraph_capture_sizes":[4, 8, 12, 16,20,24,28, 32]}' \
+--additional-config '{"enable_npugraph_ex": true, "fuse_muls_add":true,"multistream_overlap_shared_expert":true,"recompute_scheduler_enable" : true}' \
+--trust-remote-code \
+--max-num-seqs 8 \
+--gpu-memory-utilization 0.92 \
+--async-scheduling \
+--quantization ascend \
+--enable-auto-tool-choice \
+--tool-call-parser glm47 \
+--reasoning-parser glm45 \
+--kv-transfer-config \
+'{"kv_connector": "MooncakeConnectorV1",
+"kv_role": "kv_consumer",
+"kv_port": "30100",
+"engine_id": "1",
+"kv_connector_extra_config": {
+"use_ascend_direct": true,
+"prefill": {
+"dp_size": 4,
+"tp_size": 8
+},
+"decode": {
+"dp_size": 16,
+"tp_size": 4
+}
+}
+}'
+```
+
+Decode1 Node1配置：与Decode1 Node0一致，更换成本机IP和端口，其余配置不变
+```bash
+nic_name="xxxx" # change to your own nic name
+local_ip="xxxx" # change to your own ip
+```
+
+#### 依次在每个节点上启动推理服务
+
+Prefill1 Node0启动，需要修改高亮的：
+```
+python launch_online_dp.py --dp-size 4 --tp-size 8 --dp-size-local 2 --dp-rank-start 0 --dp-address 100.100.135.153 --dp-rpc-port 10521 --vllm-start-port 6700
+```
+
+Prefill1 Node1启动，需要修改高亮的：
+```
+python launch_online_dp.py --dp-size 4 --tp-size 8 --dp-size-local 2 --dp-rank-start 2 --dp-address 100.100.135.153 --dp-rpc-port 10521 --vllm-start-port 6700
+```
+
+Decode1 Node0启动，需要修改高亮的：
+```
+python launch_online_dp.py --dp-size 16 --tp-size 4 --dp-size-local 4 --dp-rank-start 0 --dp-address 100.100.135.161 --dp-rpc-port 10523 --vllm-start-port 6721
+```
+
+Decode1 Node1启动，需要修改高亮的：
+```
+python launch_online_dp.py --dp-size 16 --tp-size 4 --dp-size-local 4 --dp-rank-start 4 --dp-address 100.100.135.161 --dp-rpc-port 10523 --vllm-start-port 6721
+```
+
+Decode1 Node2启动，需要修改高亮的：
+```
+python launch_online_dp.py --dp-size 16 --tp-size 4 --dp-size-local 4 --dp-rank-start 8 --dp-address 100.100.135.161 --dp-rpc-port 10523 --vllm-start-port 6721
+```
+
+Decode1 Node3启动，需要修改高亮的：
+```
+python launch_online_dp.py --dp-size 16 --tp-size 4 --dp-size-local 4 --dp-rank-start 12 --dp-address 100.100.135.161 --dp-rpc-port 10523 --vllm-start-port 6721
+```
+
+在所有节点上观察Application startup complete代表启动成功
+
+
+#### 在一个prefill节点创建proxy脚本load_balance_proxy_server_example.py并启动proxy
+
+脚本内容如下：
+```python
+# Adapted from https://github.com/vllm-project/vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tutorial: Using the Load Balance Proxy Server Example
+#
+# This proxy server is designed to distribute requests between multiple
+# "prefiller" and "decoder" backend servers for large language model inference.
+# It is useful for scaling out inference workloads and balancing load across
+# multiple backend instances.
+#
+# Features:
+# - Load balances requests to multiple prefiller and decoder servers.
+# - Supports OpenAI-compatible /v1/completions and /v1/chat/completions endpoints.
+# - Streams responses from backend servers to clients.
+#
+# Prerequisites:
+# - Python 3.10+
+# - Install dependencies:
+#     pip install fastapi<0.124.0 httpx uvicorn vllm
+#
+# Step 1: Start Your Backend Servers
+# ----------------------------------
+# You need to have at least one prefiller and one decoder backend running.
+# These can be mock servers or actual vLLM servers.
+#
+# For testing, you can use the provided mock server:
+#
+#   vllm serve --host 0.0.0.0 --port 8100 ... # Prefiller 1
+#   vllm serve --host 0.0.0.0 --port 8101 ... # Prefiller 2
+#   vllm serve --host 0.0.0.0 --port 8200 ... # Decoder 1
+#   vllm serve --host 0.0.0.0 --port 8201 ... # Decoder 2
+#
+# Step 2: Start the Proxy Server
+# ------------------------------
+# Run the proxy server, specifying the host/port for each prefiller and decoder:
+#
+#   python load_balance_proxy_server_example.py \
+#     --host 0.0.0.0 --port 9000 \
+#     --prefiller-hosts 127.0.0.1 127.0.0.1 \
+#     --prefiller-ports 8100 8101 \
+#     --decoder-hosts 127.0.0.1 127.0.0.1 \
+#     --decoder-ports 8200 8201
+#
+# This will start the proxy on port 9000, load balancing between two prefiller
+# and two decoder servers.
+#
+# Step 3: Send a Request to the Proxy
+# -----------------------------------
+# You can now send OpenAI-compatible requests to the proxy. For example:
+#
+#   curl -X POST http://localhost:9000/v1/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#           "model": "your-model",
+#           "prompt": "The quick brown fox jumps over the lazy dog",
+#           "max_tokens": 16
+#         }'
+#
+# Or for chat completions:
+#
+#   curl -X POST http://localhost:9000/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#           "model": "your-model",
+#           "messages": [{"role": "user", "content": "Hello!"}],
+#           "max_tokens": 16
+#         }'
+#
+# Step 4: Health Check
+# --------------------
+# To check if the proxy is running and see how many backend instances are
+# connected, use:
+#
+#   curl http://localhost:9000/healthcheck
+#
+# This will return a JSON object with the status and the number of prefiller
+# and decoder instances.
+#
+# Step 5: Add or Remove Prefiller or Decoder Instances (Optional)
+# ---------------------------------------------------------------
+# You can add or remove prefiller or decoder instances after the proxy is started.
+# For example, add 2 prefiller instances:
+#
+#   curl -X POST http://localhost:9000/instances/add \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#           "type": "prefill",
+#           "instances": ["127.0.0.1:8102", "127.0.0.1:8103"]
+#         }'
+#
+# or remove 1 decoder instance:
+#
+#   curl -X POST http://localhost:9000/instances/remove \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#           "type": "decode",
+#           "instances": "127.0.0.1:8201"
+#         }'
+#
+# This will return a JSON object with the adding or removing info
+# and the current prefiller and decoder instances.
+#
+# When adding instances, if the instances are not started,
+# the proxy will wait and try until the instances to be started
+# or exceeding the number of attempts
+#
+# Notes:
+# - You can scale the number of prefiller and decoder servers as needed.
+# - The proxy will round-robin requests to balance load.
+# - For production, ensure your backend servers are robust and secure.
+#
+# For more details, see the code and comments in this file.
+import argparse
+import asyncio
+import functools
+import heapq
+import ipaddress
+import json
+import os
+import sys
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+try:
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+except ImportError:
+import logging
+logger = logging.getLogger(__name__)
+# Add uvloop for faster event loop if available
+try:
+import uvloop
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+pass
+@dataclass
+class InstanceType:
+PREFILL: str = "prefill"
+DECODE: str = "decode"
+TAINT_PRIORITY = 1e15
+class ServerState:
+def __init__(self, host, port):
+self.host = host
+self.port = port
+self.url = f"http://{host}:{port}/v1"
+try:
+ip = ipaddress.ip_address(self.host)
+if isinstance(ip, ipaddress.IPv6Address):
+self.url = f"http://[{host}]:{port}/v1"
+except Exception:
+pass
+self.client = httpx.AsyncClient(
+timeout=None,
+base_url=self.url,
+limits=httpx.Limits(max_connections=100000, max_keepalive_connections=100000),
+)
+self.active_tokens = 0
+self.active_kv_cache = 0  # Only for prefiller
+self.active_requests = 0  # Number of active requests
+self.aborted_requests = set()  # Track aborted requests
+# Removed individual server lock - will use global locks instead
+def __eq__(self, other):
+self_host = self.host.replace("localhost", "0.0.0.0").replace("127.0.0.1", "0.0.0.0")
+other_host = other.host.replace("localhost", "0.0.0.0").replace("127.0.0.1", "0.0.0.0")
+return self_host == other_host and str(self.port) == str(other.port)
+def __hash__(self):
+self_host = self.host.replace("localhost", "0.0.0.0").replace("127.0.0.1", "0.0.0.0")
+return hash((self_host, str(self.port)))
+def __repr__(self):
+return f"{self.host}:{self.port}"
+class ProxyState:
+def __init__(self, prefiller_instances, decoder_instances):
+self.request_num = 0
+self.tainted_prefillers: list[ServerState] = []
+self.tainted_decoders: list[ServerState] = []
+self.node_listener = NodeListener(self)
+self.prefillers: list[ServerState] = [ServerState(h, p) for h, p in prefiller_instances]
+self.decoders: list[ServerState] = [ServerState(h, p) for h, p in decoder_instances]
+self.req_to_prefiller = {}
+self.req_id_lock = asyncio.Lock()
+# Removed selection locks - no longer needed for synchronous methods
+# Initialize priority queues for efficient server selection
+# Each entry is (priority_score, server_index, server_reference)
+# Lower priority score = higher priority (less loaded)
+self.prefiller_heap = [(0.0, i, server) for i, server in enumerate(self.prefillers)]
+self.decoder_heap = [(0.0, i, server) for i, server in enumerate(self.decoders)]
+heapq.heapify(self.prefiller_heap)
+heapq.heapify(self.decoder_heap)
+def _update_prefiller_priority(self, server_idx: int):
+"""Update the priority of a prefiller server in the heap."""
+server = self.prefillers[server_idx]
+# Priority based on active_tokens and active_kv_cache
+priority = server.active_tokens + server.active_kv_cache * 0.3
+# Remove old entry and add new one
+self.prefiller_heap = [(p, i, s) for p, i, s in self.prefiller_heap if i != server_idx]
+heapq.heappush(self.prefiller_heap, (priority, server_idx, server))
+def _update_decoder_priority(self, server_idx: int):
+"""Update the priority of a decoder server in the heap."""
+server = self.decoders[server_idx]
+priority = server.active_tokens
+# Remove old entry and add new one
+self.decoder_heap = [(p, i, s) for p, i, s in self.decoder_heap if i != server_idx]
+heapq.heappush(self.decoder_heap, (priority, server_idx, server))
+def abort_prefiller_request(self, server_idx: int, request_id):  # Changed to synchronous
+"""
+Mark a request as aborted. This will helps to release kv cache in
+prefiller node.
+"""
+# No lock needed - atomic operation
+if server_idx >= len(self.prefillers):
+return
+self.prefillers[server_idx].aborted_requests.add(request_id)
+def acquire_aborted_prefiller_requests(self, server_idx: int):  # Changed to synchronous
+"""
+Get the set of aborted requests and clear it.
+This is used to release kv cache in prefiller node.
+"""
+# No lock needed - atomic operation
+if server_idx >= len(self.prefillers):
+return set()
+aborted_requests = self.prefillers[server_idx].aborted_requests.copy()
+self.prefillers[server_idx].aborted_requests.clear()
+return aborted_requests
+async def next_req_id(self):
+async with self.req_id_lock:
+return str(uuid.uuid4())
+def select_prefiller(self, token_count):  # Changed to synchronous
+# No lock needed - entire function is atomic
+if not self.prefiller_heap:
+raise RuntimeError("No prefiller servers available")
+priority, chosen, server = heapq.heappop(self.prefiller_heap)
+# Update the chosen server atomically
+self.prefillers[chosen].active_tokens += token_count
+self.prefillers[chosen].active_kv_cache += token_count
+# Update priority and re-add to heap
+self._update_prefiller_priority(chosen)
+return chosen
+def release_prefiller(self, idx, token_count):  # Changed to synchronous
+# No lock needed - atomic operation
+if idx >= len(self.prefillers):
+return
+self.prefillers[idx].active_tokens -= token_count
+# Update priority queue after releasing
+self._update_prefiller_priority(idx)
+def release_prefiller_kv(self, idx, token_count):  # Changed to synchronous
+# No lock needed - atomic operation
+if idx >= len(self.prefillers):
+return
+if self.prefillers[idx].active_kv_cache > 0:
+self.prefillers[idx].active_kv_cache -= token_count
+# Update priority queue after releasing
+self._update_prefiller_priority(idx)
+def select_decoder(self, token_count):  # Changed to synchronous
+# No lock needed - entire function is atomic
+if not self.decoder_heap:
+raise RuntimeError("No decoder servers available")
+priority, chosen, server = heapq.heappop(self.decoder_heap)
+# Update the chosen server atomically
+self.decoders[chosen].active_tokens += token_count
+# Update priority and re-add to heap
+self._update_decoder_priority(chosen)
+return chosen
+def release_decoder(self, idx, token_count):  # Changed to synchronous
+# No lock needed - atomic operation
+if idx >= len(self.decoders):
+return
+self.decoders[idx].active_tokens -= token_count
+# Update priority queue after releasing
+self._update_decoder_priority(idx)
+# Omni_infer's calculate_input_scores function
+def calculate_prefill_scores(self, request_length: int) -> float:
+length_score = request_length / 4.0
+input_score = length_score * 0.0345 + 120.0745
+return input_score
+def calculate_decode_scores(self, request_length: int) -> float:
+return request_length
+async def add_instances(self, instance_type: str, instances: list[ServerState]) -> tuple[list[str], list[str]]:
+added_nodes, waiting_nodes = [], []
+for server in instances:
+is_valid = await self.node_listener.check_instance_status(server.client)
+if is_valid and instance_type == InstanceType.PREFILL:
+self.add_prefillers([server])
+added_nodes.append(str(server))
+elif is_valid and instance_type == InstanceType.DECODE:
+self.add_decoders([server])
+added_nodes.append(str(server))
+else:
+node = str(server)
+self.node_listener.waiting_nodes[node] = (instance_type, server, 0)
+waiting_nodes.append(node)
+return added_nodes, waiting_nodes
+def add_prefillers(self, instances: list[ServerState]) -> None:
+for server in instances:
+if server in self.tainted_prefillers:
+self.tainted_prefillers.remove(server)
+self.prefiller_heap = [
+(0, idx, server) if srv == server else (priority, idx, srv)
+for priority, idx, srv in self.prefiller_heap
+]
+heapq.heapify(self.prefiller_heap)
+elif server not in self.prefillers:
+self.prefillers.append(server)
+# prefiller_heap: [(priority_0, 0, server_0)] -> [(priority_0, 0, server_0), (0, 1, server_1)]
+heapq.heappush(self.prefiller_heap, (0, len(self.prefillers) - 1, server))
+self.print_status(f"Add prefiller instances: {instances}.")
+def add_decoders(self, instances: list[ServerState]) -> None:
+for server in instances:
+if server in self.tainted_decoders:
+self.tainted_decoders.remove(server)
+self.decoder_heap = [
+(0, idx, server) if srv == server else (priority, idx, srv)
+for priority, idx, srv in self.decoder_heap
+]
+heapq.heapify(self.decoder_heap)
+elif server not in self.decoders:
+self.decoders.append(server)
+# decoder_heap: [(priority_0, 0, server_0)] -> [(priority_0, 0, server_0), (0, 1, server_1)]
+heapq.heappush(self.decoder_heap, (0, len(self.decoders) - 1, server))
+self.print_status(f"Add decoder instances: {instances}.")
+def remove_prefillers(self, instances: list[ServerState]) -> bool:
+if not instances:
+return False
+if self.request_num > 0:
+logger.warning(f"Start to taint prefill instances {instances}.")
+self._taint_prefillers(instances)
+return True
+instances_to_remove = set(instances)
+self.prefillers = [server for server in self.prefillers if server not in instances_to_remove]
+prefiller_heap_copy = self.prefiller_heap.copy()
+prefiller_heap_copy.sort(key=lambda x: x[1])  # sorted by key: prefiller_idx
+prefiller_heap = []
+idx = 0
+for priority, _, server in prefiller_heap_copy:
+if server not in instances_to_remove:
+prefiller_heap.append((priority, idx, server))
+idx += 1
+# prefiller_heap: [(priority_0, 0, server_0), (priority_1, 1, server_1)] -> [(priority_1, 0, server_1)]
+self.prefiller_heap = prefiller_heap
+heapq.heapify(self.prefiller_heap)
+self.print_status(f"Remove prefiller instances: {instances}.")
+return False
+def remove_decoders(self, instances: list[ServerState]) -> bool:
+if not instances:
+return False
+if self.request_num > 0:
+logger.warning(f"Start to taint decode instances {instances}.")
+self._taint_decoders(instances)
+return True
+instances_to_remove = set(instances)
+self.decoders = [server for server in self.decoders if server not in instances_to_remove]
+decoder_heap_copy = self.decoder_heap.copy()
+decoder_heap_copy.sort(key=lambda x: x[1])  # sorted by key: decoder_idx
+decoder_heap = []
+idx = 0
+for priority, _, server in decoder_heap_copy:
+if server not in instances_to_remove:
+decoder_heap.append((priority, idx, server))
+idx += 1
+# decoder_heap: [(priority_0, 0, server_0), (priority_1, 1, server_1)] -> [(priority_1, 0, server_1)]
+self.decoder_heap = decoder_heap
+heapq.heapify(self.decoder_heap)
+self.print_status(f"Remove decoder instances: {instances}.")
+return False
+def _taint_prefillers(self, instances: list[ServerState]) -> None:
+instances_to_taint = set(instances)
+for server in self.prefillers:
+if server in instances_to_taint and server not in self.tainted_prefillers:
+self.tainted_prefillers.append(server)
+self.prefiller_heap = [
+(TAINT_PRIORITY, idx, srv) if srv in instances_to_taint else (priority, idx, srv)
+for priority, idx, srv in self.prefiller_heap
+]
+heapq.heapify(self.prefiller_heap)
+def _taint_decoders(self, instances: list[ServerState]) -> None:
+instances_to_taint = set(instances)
+for server in self.decoders:
+if server in instances_to_taint and server not in self.tainted_decoders:
+self.tainted_decoders.append(server)
+self.decoder_heap = [
+(TAINT_PRIORITY, idx, srv) if srv in instances_to_taint else (priority, idx, srv)
+for priority, idx, srv in self.decoder_heap
+]
+heapq.heapify(self.decoder_heap)
+def print_status(self, msg: str) -> None:
+status = {
+"prefill_instances": [str(server) for server in self.prefillers],
+"decode_instances": [str(server) for server in self.decoders],
+}
+print(f"{msg} Status: {status}")
+proxy_state = None
+class NodeListener:
+def __init__(self, proxy):
+self.proxy_state = proxy
+self.waiting_nodes: dict[str, tuple[str, Any, int]] = {}
+self.listening_thread = threading.Thread(target=self._node_listener, daemon=True)
+self.listening_thread.start()
+def _node_listener(self) -> None:
+while True:
+for node, (instance_type, server, check_times) in list(self.waiting_nodes.items()):
+is_valid = asyncio.run(self.check_instance_status(server.client))
+print(f"Checking instance {node}...")
+check_times += 1
+if is_valid:
+if instance_type == InstanceType.PREFILL:
+self.proxy_state.add_prefillers([server])
+else:
+self.proxy_state.add_decoders([server])
+self.waiting_nodes.pop(node)
+elif check_times == global_args.max_waiting_retries:
+print(f"Instance {node} was not added to the proxy.")
+self.waiting_nodes.pop(node)
+else:
+self.waiting_nodes[node] = (instance_type, server, check_times)
+if self.proxy_state.tainted_prefillers and not self.proxy_state.request_num:
+need_waiting = self.proxy_state.remove_prefillers(self.proxy_state.tainted_prefillers)
+if not need_waiting:
+self.proxy_state.tainted_prefillers.clear()
+if self.proxy_state.tainted_decoders and not self.proxy_state.request_num:
+need_waiting = self.proxy_state.remove_decoders(self.proxy_state.tainted_decoders)
+if not need_waiting:
+self.proxy_state.tainted_decoders.clear()
+time.sleep(global_args.waiting_retry_interval)
+@staticmethod
+async def check_instance_status(client: httpx.AsyncClient) -> bool:
+endpoint = "/models"
+headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+try:
+response = await client.get(endpoint, headers=headers)
+response.raise_for_status()
+return True
+except (httpx.RequestError, httpx.HTTPStatusError):
+return False
+def parse_args():
+parser = argparse.ArgumentParser()
+parser.add_argument("--port", type=int, default=8000)
+parser.add_argument("--host", type=str, default="localhost")
+parser.add_argument("--prefiller-hosts", type=str, nargs="+", default=["localhost"])
+parser.add_argument("--prefiller-ports", type=int, nargs="+", default=[8001])
+parser.add_argument("--decoder-hosts", type=str, nargs="+", default=["localhost"])
+parser.add_argument("--decoder-ports", type=int, nargs="+", default=[8002])
+parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries for HTTP requests")
+parser.add_argument(
+"--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
+)
+parser.add_argument(
+"--max-waiting-retries", type=int, default=3, help="Maximum number of retries for waiting nodes to be started"
+)
+parser.add_argument(
+"--waiting-retry-interval",
+type=float,
+default=10,
+help="Check interval (seconds) for waiting nodes to be started",
+)
+args = parser.parse_args()
+if len(args.prefiller_hosts) != len(args.prefiller_ports):
+raise ValueError("Number of prefiller hosts must match number of prefiller ports")
+if len(args.decoder_hosts) != len(args.decoder_ports):
+raise ValueError("Number of decoder hosts must match number of decoder ports")
+args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
+args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
+return args
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+global proxy_state
+proxy_state = ProxyState(global_args.prefiller_instances, global_args.decoder_instances)
+print(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
+yield
+for p in proxy_state.prefillers:
+await p.client.aclose()
+for d in proxy_state.decoders:
+await d.client.aclose()
+async def listen_for_disconnect(request: Request) -> None:
+"""Return if a disconnect message is received"""
+while True:
+message = await request.receive()
+if message["type"] == "http.disconnect":
+break
+def with_cancellation(handler_func):
+@functools.wraps(handler_func)
+async def wrapper(*args, **kwargs):
+request = kwargs["request"]
+handler_task = asyncio.create_task(handler_func(*args, **kwargs))
+cancellation_task = asyncio.create_task(listen_for_disconnect(request))
+done, pending = await asyncio.wait([handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED)
+for task in pending:
+task.cancel()
+if handler_task in done:
+return handler_task.result()
+return None
+return wrapper
+app = FastAPI(lifespan=lifespan)
+async def send_request_to_service(
+client: httpx.AsyncClient,
+prefiller_id: int,
+endpoint: str,
+req_data: dict,
+request_id: str,
+max_retries: int = 3,
+base_delay: float = 0.2,
+):
+aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
+req_data = req_data.copy()
+req_data["kv_transfer_params"] = {
+"do_remote_decode": True,
+"do_remote_prefill": False,
+"remote_engine_id": None,
+"remote_block_ids": None,
+"remote_host": None,
+"remote_port": None,
+"aborted_request": list(aborted_requests),
+}
+req_data["stream"] = False
+req_data["max_tokens"] = 1
+req_data["min_tokens"] = 1
+if "max_completion_tokens" in req_data:
+req_data["max_completion_tokens"] = 1
+if "stream_options" in req_data:
+del req_data["stream_options"]
+headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
+last_exc = None
+for attempt in range(1, max_retries + 1):
+try:
+response = await client.post(endpoint, json=req_data, headers=headers)
+response.raise_for_status()
+return response
+except (httpx.RequestError, httpx.HTTPStatusError) as e:
+logger.warning(f"Attempt {attempt} failed for {endpoint}: {str(e)}")
+last_exc = e
+if attempt < max_retries:
+await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+else:
+logger.error(f"All {max_retries} attempts failed for {endpoint}.")
+raise last_exc
+async def stream_service_response_with_retry(
+client: httpx.AsyncClient,
+endpoint: str,
+req_data: dict,
+request_id: str,
+max_retries: int = 3,
+base_delay: float = 0.2,
+):
+headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
+for attempt in range(1, max_retries + 1):
+try:
+async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
+response.raise_for_status()
+first_chunk_sent = False
+async for chunk in response.aiter_bytes():
+first_chunk_sent = True
+yield chunk
+return  # Success, exit after streaming
+except (httpx.RequestError, httpx.HTTPStatusError) as e:
+if attempt < max_retries:
+logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
+await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+else:
+logger.error(f"All {max_retries} attempts failed for streaming {endpoint}.")
+raise e
+except Exception as e:
+# If any chunk has been sent, do not retry, just log and drop
+if "first_chunk_sent" in locals() and first_chunk_sent:
+logger.error(f"Streaming to client interrupted after response started: {str(e)}")
+return
+else:
+if attempt < max_retries:
+logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
+await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+else:
+logger.error(f"All {max_retries} attempts failed for streaming {endpoint}.")
+raise e
+async def _handle_select_instance(api: str, req_data: Any, request_length: int):
+prefiller_score = proxy_state.calculate_prefill_scores(request_length)
+logger.debug(f"Request length: {request_length}, Prefiller score: {prefiller_score}")
+request_id = await proxy_state.next_req_id()
+# Select prefiller
+prefiller_idx = proxy_state.select_prefiller(prefiller_score)
+prefiller = proxy_state.prefillers[prefiller_idx]
+# Send request to prefiller
+response = await send_request_to_service(
+prefiller.client,
+prefiller_idx,
+api,
+req_data,
+request_id,
+max_retries=global_args.max_retries,
+base_delay=global_args.retry_delay,
+)
+proxy_state.release_prefiller(prefiller_idx, prefiller_score)
+response_json = response.json()
+kv_transfer_params = response_json.get("kv_transfer_params", {})
+if kv_transfer_params:
+req_data["kv_transfer_params"] = kv_transfer_params
+# Select decoder
+decoder_score = proxy_state.calculate_decode_scores(request_length)
+logger.debug("Decoder score: %f", decoder_score)
+# Use the prefiller's kv_transfer_params to select decoder
+decoder_idx = proxy_state.select_decoder(decoder_score)
+decoder = proxy_state.decoders[decoder_idx]
+logger.debug("Using %s %s", prefiller.url, decoder.url)
+return InstanceInfo(
+request_id=request_id,
+prefiller_idx=prefiller_idx,
+prefiller_score=prefiller_score,
+prefiller=prefiller,
+decoder=decoder,
+decoder_idx=decoder_idx,
+decoder_score=decoder_score,
+)
+@dataclass
+class InstanceInfo:
+request_id: str
+prefiller_idx: int
+prefiller_score: float
+prefiller: ServerState
+decoder_idx: int
+decoder_score: float
+decoder: ServerState
+async def _handle_completions(api: str, request: Request):
+try:
+proxy_state.request_num += 1
+req_data = await request.json()
+req_body = await request.body()
+request_length = len(req_body)
+instance_info = await _handle_select_instance(api, req_data, request_length)
+stream_flag = bool(req_data.get("stream", False))
+chat_flag = "messages" in req_data
+if "prompt" in req_data:
+origin_prompt = req_data["prompt"]
+elif chat_flag:
+messages = req_data["messages"]
+origin_prompt = messages[0].get("content", "")
+else:
+origin_prompt = ""
+# refer to vLLM sampling_params: max_token default value
+origin_max_tokens = req_data.get("max_tokens", 16)
+async def generate_stream():
+nonlocal instance_info
+generated_token = ""
+released_kv = False
+retry_count = 0
+retry = True
+completion_tokens = 0
+# Only one await per chunk, minimal logic in loop
+try:
+while retry:
+retry = False
+async for chunk in stream_service_response_with_retry(
+instance_info.decoder.client,
+api,
+req_data,
+request_id=instance_info.request_id,
+max_retries=global_args.max_retries,
+base_delay=global_args.retry_delay,
+):
+if not released_kv and chunk:
+proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
+released_kv = True
+try:
+chunk_str = chunk.decode("utf-8").strip()
+except UnicodeDecodeError:
+logger.debug(f"Skipping chunk: {chunk}")
+yield chunk
+continue
+if not chunk_str:
+continue
+if chunk_str.startswith("data: "):
+chunk_str = chunk_str[len("data: ") :]
+try:
+chunk_json = json.loads(chunk_str)
+except json.JSONDecodeError:
+# if chunk is [done], skip it.
+logger.debug(f"Skipping chunk: {chunk_str}")
+yield chunk
+continue
+choices = chunk_json.get("choices", [])
+if not choices:
+yield chunk
+continue
+choice = choices[0]
+delta = choice.get("delta") or {}
+message = choice.get("message") or {}
+content = delta.get("content") or message.get("content") or choice.get("text") or ""
+generated_token += content
+stop_reason = choice.get("stop_reason")
+usage = chunk_json.get("usage", {})
+completion_tokens = (
+(completion_tokens + 1)
+if stream_flag
+else (completion_tokens + usage.get("completion_tokens"))
+)
+if stop_reason == "recomputed":
+retry = True
+retry_count += 1
+if chat_flag:
+messages[0]["content"] = origin_prompt + generated_token
+else:
+req_data["prompt"] = origin_prompt + generated_token
+req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
+tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
+instance_info = await _handle_select_instance(api, req_data, tmp_request_length)
+break
+if retry_count > 0 and not stream_flag:
+if chat_flag:
+choice["message"]["content"] = generated_token
+else:
+choice["text"] = generated_token
+chunk = json.dumps(chunk_json).encode("utf-8")
+yield chunk
+except Exception as e:
+logger.error(
+f"Error during streaming from decoder {instance_info.decoder.url}: {str(e)} "
+f"the aborted request {instance_info.request_id} will be routing to the target "
+"prefiller when new request is ready to dispatch to it"
+)
+proxy_state.abort_prefiller_request(instance_info.prefiller_idx, instance_info.request_id)
+proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
+# After streaming done, release tokens
+proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
+# Determine the correct media type based on stream flag
+media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
+return StreamingResponse(generate_stream(), media_type=media_type)
+except Exception as e:
+import traceback
+exc_info = sys.exc_info()
+print(f"Error occurred in disagg prefill proxy server - {api} endpoint")
+print(e)
+print("".join(traceback.format_exception(*exc_info)))
+raise
+finally:
+proxy_state.request_num -= 1
+async def _handle_adjust_instances(adjust_mode: str, request: Request):
+try:
+req_data = await request.json()
+instance_type = req_data.get("type", "")
+instances = req_data.get("instances", [])
+if isinstance(instances, str):
+instances = [instances]
+instances = trans_instances(instances)
+all_msg = f"{adjust_mode} {instance_type} instances: {[str(server) for server in instances]}."
+if instance_type not in [InstanceType.PREFILL, InstanceType.DECODE]:
+return {
+"error": f"Instance type {instance_type} is not supported. "
+f"Only support '{InstanceType.PREFILL}' and '{InstanceType.DECODE}'."
+}
+if adjust_mode == "add":
+added_nodes, waiting_nodes = await proxy_state.add_instances(instance_type, instances)
+if waiting_nodes:
+all_msg = (
+f"{adjust_mode} {instance_type} instances: {added_nodes}. "
+f"Instances {waiting_nodes} are waiting to be added."
+)
+elif adjust_mode == "remove":
+if instance_type == InstanceType.PREFILL:
+need_waiting = proxy_state.remove_prefillers(instances)
+else:
+need_waiting = proxy_state.remove_decoders(instances)
+if need_waiting:
+all_msg = f"Instances {instances} are isolated and waiting to be removed."
+return {
+"message": all_msg,
+"current_prefill_instances": [str(prefiller) for prefiller in proxy_state.prefillers],
+"current_decode_instances": [str(decoder) for decoder in proxy_state.decoders],
+}
+except Exception as e:
+logger.error(f"Failed to {adjust_mode} instances: {e}")
+raise e
+def trans_instances(instances: list[str]) -> list[ServerState]:
+server_list = []
+for instance in instances:
+h, p = instance.split(":")
+server_list.append(ServerState(h, int(p)))
+return server_list
+@app.post("/v1/completions")
+@with_cancellation
+async def handle_completions(request: Request):
+return await _handle_completions("/completions", request)
+@app.post("/v1/chat/completions")
+@with_cancellation
+async def handle_chat_completions(request: Request):
+return await _handle_completions("/chat/completions", request)
+@app.get("/healthcheck")
+async def healthcheck():
+return {
+"status": "ok",
+"prefill_instances": len(proxy_state.prefillers),
+"decode_instances": len(proxy_state.decoders),
+}
+@app.post("/instances/add")
+async def handle_add_instances(request: Request):
+return await _handle_adjust_instances("add", request)
+@app.post("/instances/remove")
+async def handle_remove_instances(request: Request):
+return await _handle_adjust_instances("remove", request)
+if __name__ == "__main__":
+global global_args
+global_args = parse_args()
+import uvicorn
+uvicorn.run(app, host=global_args.host, port=global_args.port)
+```
+
+#### 通过proxy对外提供服务ip和端口
+
+```
+unset http_proxy
+unset https_proxy
+python load_balance_proxy_server_example.py \
+--port 1999 \
+--host 0.0.0.0 \
+--prefiller-hosts \
+100.100.135.153 \
+100.100.135.153 \
+100.100.135.154 \
+100.100.135.154 \
+--prefiller-ports \
+6700 6701 \
+6700 6701 \
+--decoder-hosts \
+100.100.135.161 \
+100.100.135.161 \
+100.100.135.161 \
+100.100.135.161 \
+100.100.135.163 \
+100.100.135.163 \
+100.100.135.163 \
+100.100.135.163 \
+100.100.135.165 \
+100.100.135.165 \
+100.100.135.165 \
+100.100.135.165 \
+100.100.135.166 \
+100.100.135.166 \
+100.100.135.166 \
+100.100.135.166 \
+--decoder-ports \
+6721 6722 6723 6724 \
+6721 6722 6723 6724 \
+6721 6722 6723 6724 \
+6721 6722 6723 6724
+```
+
+# GLM-5.1单机典型性能指标
+
+## Aisbench性能/精度测试工具使用简介
+
+### 安装环境确认
+
+（1）查询aisbench的安装目录
+pip list |grep ais
+
+（2）查询配置文件路径
+每个模型任务、数据集任务和结果呈现任务都对应一个配置文件，运行命令前需要修改这些配置文件的内容。这些配置文件路径可以通过在原有AISBench命令基础上加上--search来查询，例如：
+ais_bench --models vllm_api_stream_chat --datasets gsm8k_gen_0_shot_cot_str_perf –search
+
+需要确认相关配置都存在且在个人目录下
+### 性能测试方法
+
+#### 使用prefix_cache小工具测试
+
+参考下面的内容，可以生成prefix cache命中率90%的数据，进行性能测试： https://wiki.huawei.com/domains/143914/wiki/137614/WIKI202511048896614
+### 精度测试方法
+
+服务化精度测评详细测试方法参考官网：https://ais-bench-benchmark-rf.readthedocs.io/zh-cn/latest/base_tutorials/scenes_intro/home.html#id2
+#### 数据集准备
+
+开源数据集下载链接及部署方法参考官网：
+https://ais-bench-benchmark-rf.readthedocs.io/zh-cn/latest/base_tutorials/all_params/datasets.html#id3
+以GSLM8K为例
+# linux服务器内，处于工具根路径下
+cd ais_bench/datasets
+wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/gsm8k.zip
+unzip gsm8k.zip
+rm gsm8k.zip
+#### 服务化后端修改
+
+服务化后端配置详细说明见官网：https://ais-bench-benchmark-rf.readthedocs.io/zh-cn/latest/base_tutorials/all_params/models.html#id2
+vim  aisbench安装路径/benchmark/ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_chat.py
+```python
+from ais_bench.benchmark.models import VLLMCustomAPIChat
+from ais_bench.benchmark.utils.postprocess.model_postprocessors import extract_non_reasoning_content
+```
+
+models = [
+dict(
+attr="service",
+type=VLLMCustomAPIChat,
+abbr="vllm-api-general-chat",
+path="",
+model="glm",
+stream=False,
+request_rate=0,
+use_timestamp=False,
+retry=2,
+api_key="",
+host_ip="100.100.xx.xx ",
+host_port= 8088,
+url="",
+max_out_len= 131072,##根据实际数据集最大输出长度确定，本次精度测试使用128k输出长度验证
+batch_size= 32,
+trust_remote_code=False,
+generation_kwargs=dict(
+temperature =  1, ##后处理参数根据实际的模型权重的generation_config.json确定
+top_p = 0.95,##后处理参数根据实际的模型权重的generation_config.json确定
+ignore_eos = False,
+),
+pred_postprocessor=dict(type=extract_non_reasoning_content),
+)
+#### 执行精度测试
+
+ais_bench --models vllm_api_general_chat --datasets gsm8k_gen_0_shot_cot_chat_prompt --merge-ds –debug
+其他数据集的测试方法类似，需要根据数据集测试要求更换gsm8k_gen_0_shot_cot_chat_prompt配置，详细的配置参考官网数据集测试要求。https://ais-bench-benchmark-rf.readthedocs.io/zh-cn/latest/base_tutorials/all_params/datasets.html#id3
+## GLM-5.1性能表现
+
+单机A3(w4a8) PD混部场景：
+单机A3混部：DP2+TP8+EP16并行。性能表现：3584输入1024输出，49并发，TTFT平均1.9s,TOPT平均 48.5ms，单卡输出吞吐114.75TPS，当前服务端最大支持200K（202752）输入输出长度，支持prefix Cache，支持chunked-prefill、支持异步调度、支持图模式、支持MTP。
+双机A2(w4a8) PD混部场景：
+双机A2混部：DP2+TP8+EP16并行。性能表现：32048输入1024输出，8并发，TTFT平均1.8s,TOPT平均 48.6ms，单卡输出吞吐9.28TPS，当前服务端最大支持200K（202752）输入输出长度，支持prefix Cache，支持chunked-prefill、支持异步调度、支持图模式、支持MTP。
+双机A3(w8a8) PD混部场景：
+双机A3混部：DP4+TP8+EP32并行。性能表现：65536输入1024输出9并发，TTFT平均6.3s,TOPT平均 47.6ms，单卡输出吞吐10TPS，当前服务端最大支持200K（202752）输入输出长度，支持prefix Cache，支持chunked-prefill、支持异步调度、支持图模式、支持MTP。
+四机A3(w8a8) PD(1P1D)分离场景：
+四机PD分离部署，双机A3组成1个P节点:DP4+TP8+EP并行，双机A3组成1个D节点：DP8+TP4+EP并行。性能表现：65536输入1024输出，64并发，TTFT平均6.5s，TOPT平均 33.1ms，单卡输出吞吐45.13TPS，当前服务端最大支持200K（202752）输入输出长度，支持prefix Cache，支持chunked-prefill、支持异步调度、支持图模式、支持MTP。
+六机A3(w8a8) PD(1P1D)分离场景：
+六机PD分离部署，双机A3组成1个P节点:DP4+TP8+EP并行，四机A3组成1个D节点：DP16+TP4+EP并行。性能表现：65536输入1024输出，64并发，TTFT平均8.2s,TOPT平均 26.3ms，单卡输出吞吐34.9TPS，当前服务端最大支持200K（202752）输入输出长度，支持prefix Cache，支持chunked-prefill、支持异步调度、支持图模式、支持MTP。
+
+## GLM-5.1精度表现
+
+基于A3-六机PD分离配置测试，本次验证了部分数据集的精度，结果如下，仅供参考，w4a8格式精度测试结果可能会有降低：
+# FAQ
+
+## windows系统安装podman下载镜像
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  - 开启虚拟化配置
+Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All
+执行完会重启，选择Y
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - 重启完成后查看虚拟化是否开启
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - 虚拟化“已启用”后，需要安装wsl
+在管理员权限下登入windows powershell，执行wsl --install
+
+安装过程中会自动安装unbunt的虚拟系统，虚拟系统安装完成后，需要设置用户名和密码，此处我设置的用户名是：w-cn，并设置此用户的登入密码
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - 在虚拟系统执行sudo apt update && sudo apt upgrade -y来升级系统软件
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - 升级完系统软件后，执行sudo apt install podman -y来安装podman
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - Podman安装完成后，在虚拟系统中下载容器镜像
+命令和截图是示例，修改成实际的版本号与文件！
+A3镜像下载：Openeuler镜像文件（arm）：
+sudo podman pull --platform linux/arm64  quay.io/ascend/vllm-ascend:v0.13.0rc2-a3-openeuler
+A3镜像下载：Ubuntu镜像文件（arm）：
+sudo podman pull --platform linux/arm64  quay.io/ascend/vllm-ascend:v0.13.0rc2-a3
+A2镜像下载Openeuler 镜像文件（arm）：
+sudo podman pull --platform linux/arm64  quay.io/ascend/vllm-ascend:v0.13.0rc2-openeuler
+A2镜像下载Ubuntu镜像文件（arm）：
+sudo podman pull --platform linux/arm64  quay.io/ascend/vllm-ascend:v0.13.0rc2
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - 查看镜像文件：sudo podman images
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - 将下载好的镜像保存出来（从虚拟系统保存到pc的桌面）
+sudo podman save -o /mnt/c/Users/w-cn/Desktop/vllm-ascend_v0.14.0rc1-a3-openeuler.tar quay.io/ascend/vllm-ascend:v0.14.0rc1-a3-openeuler
+/mnt/c/Users/w-cn/Desktop/ ------本地windows系统目录
+vllm-ascend_v0.14.0rc1-a3-openeuler.tar  -------保存到windows系统镜像名称
+quay.io/ascend/vllm-ascend:v0.14.0rc1-a3-openeuler-----podman系统中镜像的repository:tag
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - 在本地桌面目录查看保存的镜像，并将镜像拷贝到硬盘
+
+## 模型文件的SHA256校验
+
+每个人下载完模型后，需要校验模型的SHA256值是否正确，防止下载过程中出现文件损坏。
+### 从ModelScope魔搭社区获取每个模型文件的SHA256值
+
+首先，打开魔搭社区模型的网页（以GLM-4.7模型为例），然后点击浏览器右上角的三个点：
+
+选择“更多工具”---“开发者工具”
+
+
+在弹出的页签，选择Network页签，然后刷新整个网页
+
+刷新完成后在在Name这一页签下找到files?Revision=master&Root=，查看右侧Response页签，打印了模型文件中所有文件的Name和对应的Sha256信息。
+
+把response的信息拷贝下来放到notepad++上，然后在当前页搜索“SHA256”
+
+把搜索到的SHA256的信息全部拷贝下来，放到一个新的空白页面
+
+可以按住键盘alt键然后进行区域选择，把不需要的内容全部删掉，只保留sha256的一串ID即可
+
+完整的模型文件的SHA256值
+
+### 从Modelers魔乐社区获取每个模型文件的SHA256值
+
+首先，打开魔乐社区模型的网页（以Eco-Tech/GLM-5-w4a8模型为例），然后点击浏览器右上角的三个点：
+
+选择“更多工具”---“开发者工具”
+
+
+按照下图顺序，依次点击“文件”，“Response”以及“GLM-5-w4a8?ref=main&repo=GLM-5-w4a8&account=Eco-Tech”
+
+把response的信息拷贝下来放到notepad++上，然后在当前页搜索“etag”(实际是文件的sha256信息)
+
+选中过滤出来的etag信息，鼠标右键---复制选中行
+
+把搜索到的etag的信息全部拷贝下来，放到一个新的空白页面
+
+可以按住键盘alt键然后进行区域选择，把不需要的内容全部删掉，只保留etag的一串ID即可
+
+完整的模型文件的etag(SHA256)值
+
+
+### PC端校验SHA256
+
+在PC端打开 windows powershell，然后修改下面的$targetPath和$outputFile
+$targetPath：模型文件所在路径
+$outputFile：模型文件所在路径+保留的sha256txt文件名称
+修改完成后，将下面这段标红的文字复制到windows powershell，即可获取模型文件的sha256值，并保存在sha256_all_files.txt文档中。
+# 定义路径（无需修改）
+$targetPath = "D:\原D盘数据\01 算力平台先遣队\新模型专项\GLM-5"
+$outputFile = "D:\原D盘数据\01 算力平台先遣队\新模型专项\GLM-5\sha256_all_files.txt"
+
+# 清空旧文件（避免追加）
+if (Test-Path $outputFile) { Remove-Item $outputFile -Force }
+
+# 核心逻辑：仅提取并保存SHA256哈希值，无任何多余内容
+Get-ChildItem -Path $targetPath -File -Recurse | ForEach-Object {
+# 仅提取certutil输出的第2行（纯哈希值），并写入文件
+$hashValue = (certutil -hashfile $_.FullName SHA256)[1].Trim()  # Trim() 去除首尾空格
+$hashValue | Out-File -FilePath $outputFile -Append -Encoding utf8
+# 控制台显示进度（可选，知道处理到哪个文件）
+Write-Host "已处理: $($_.FullName) → $hashValue"
+}
+
+Write-Host "`n执行完成！仅纯SHA256值已保存到：`n$outputFile"
+
+把PC端的模型文件SHA256值和从网站上获取的模型文件SHA256值通过compare软件对比即可
+
+### 服务器端校验SHA256
+
+把文件上传到客户服务器之后，可以通过命令行查看每个文件的SHA256值，跟通过魔搭社区页面查到的SHA256值对比，一致说明文件没问题，如果命令行查出对应文件的SHA256值和网页上的不一致，说明文件在下载和传输过程中出现损坏，需要重新下载。
+在服务器模型文件目录下执行：sha256sum  * ，即可获取目录下所有文件按照顺序排列的SHA256值
+
+把SHA256值拷贝到compare软件中与从模型网站上获取的模型文件的SHA256对比即可。
+## 小工具在个人PC下载镜像：
+
+这个工具脚本在开源的基础上做了一些优化：
+（1）彻底捕获所有传输异常
+新增对 IncompleteRead/ProtocolError/ChunkedEncodingError 的捕获，覆盖了 requests/urllib3 所有传输层中断异常，确保网络波动时一定会触发重试，而不是程序崩溃。
+（2） 适配国外仓库的网络配置
+重试次数从 5 次提升到 10 次；
+超时时间从 30/300 秒提升到 60/600 秒；
+增大 chunk_size 到 16384，减少网络 IO 次数，降低中断概率；
+优化连接池，避免频繁重连。
+（3）增强多线程容错性
+单个层的失败不再直接终止整个程序，你可以根据需求选择是否严格校验（取消注释 raise 即可）。
+（4）保留断点续传核心能力
+所有重试都会从上次中断的位置继续下载，不会重新下载整个大层，大幅节省时间。
+
+面对一些网络波动，会自动从之前的下载点续传，不是把整个大层都删掉重新下载。
+docker命令的集成好的小工具，直接下载下来，在cmd执行命令行就可以下载，不需要在本地pc安装虚拟机，上面的命令是把DockerPull.exe小工具直接放到D盘，CMD切换到D盘后直接执行
+.\docker_image_puller.exe -i quay.io/ascend/vllm-ascend:v0.13.0rc2 -a arm64下载的就是arm架构的镜像文件，文件就保存在docker_image_puller.exe所在目录下。
+## tool call配置及调用异常规避方案
+
+想要调用tool call，在vllm服务拉起时需要携带以下参数：
+```
+--tool-call-parser glm47 \
+--reasoning-parser glm45 \
+--enable-auto-tool-choice \
+```
+
+### 调用tool_call时选择auto模型，不要选择required模式
+
+response_stream = client.chat.completions.create(
+model="glm-5",
+messages=messages,
+temperature=0.95,
+top_p=0.95,
+```
+max_tokens=1024,
+```
+
+tools=tools,
+stream=False,
+tool_choice="auto"       #调用tool时把tool_choice 设置为auto模式，不选required模式
+## A2双机背靠背部署方式服务拉起失败规避方案
+
+问题现象：使用A2双机背靠背部署方式（NPU直连，没有交换机）拉起GLM5服务失败，报“HcclAllocComResourceByTiling”相关错误码。
+问题原因：A2双机背靠背直连（即双机一体机）架构下，HCCL 不支持全互联通信链路的建立。参考HCCL - aclnnMoeDistributeDispatchV3说明，该算子会进行AllToAllV通信。HCCL ALLTOALL通信在双机背靠背组网下不可用，HCCL在全互联建链时失败报错。
+规避方法：编辑文件
+vim /vllm-workspace/vllm-ascend/vllm_ascend/ascend_forward_context.py
+在select_moe_comm_method方法返回前，赋值moe_comm_type=MoECommType.ALLGATHER，强行更改通信算子。参考如下：
+
+问题详细定位跟踪链接，参考：https://wiki.huawei.com/domains/121799/wiki/231935/WIKI202601139774767
+
+## 关于控制模型输出带Think的配置
+
+当前通过请求体里面加"enable_thinking":false的配置方式无法关闭模型默认的think行为，如下图
+enable_thinking 配置true或者false输出都会带上think
+
+
+通过如下配置，可以控制输出是否带think：
+"chat_template_kwargs":{
+"enable_thinking":true
+}
+完整请求体参考：
+curl "http://100.100.xx.xx:8088/v1/chat/completions" \
+-H "Content-Type: application/json" \
+-d '{
+"model": "glm-5",
+"messages": [
+{
+"role": "user",
+"content": "你是GLM-5吗？"
+}
+],
+"max_tokens": 500,
+"ignore_eos": false,
+"chat_template_kwargs":{
+"enable_thinking":false
+}
+
+}'
+kwargs配置"enable_thinking":true，输出带think标签
+
+kwargs配置"enable_thinking":false，输出不带think标签
+
+## 服务启动失败，提示需要升级transformers版本
+
+升级transformers版本到5.4.0可以成功拉起服务。
+```
+pip install --upgrade transformers==5.4.0
+```
+
+## 初次拉起服务可能遇到长时间卡顿，需要等待
+
+问题现象截图：
+
+
+
+
+|  |  |  |  |  |
+| --- | --- | --- | --- | --- |
+|  |  |  |  |  |
+|  | GLM5.1昇腾支持一本通 | GLM5.1昇腾支持一本通 | GLM5.1昇腾支持一本通 |  |
+|  | 文档版本 | 01 | 01 |  |
+|  | 发布日期 | 2026-04-08 | 2026-04-08 |  |
+|  |  |  |  |  |
+|  | 华为技术有限公司 | 华为技术有限公司 |  |  |
+
+
+| 版权所有 © 华为技术有限公司2026。 保留一切权利。 非经本公司书面许可，任何单位和个人不得擅自摘抄、复制本文档内容的部分或全部，并不得以任何形式传播。  商标声明  和其他华为商标均为华为技术有限公司的商标。 本文档提及的其他所有商标或注册商标，由各自的所有人拥有。 |
+| --- |
+
+
+| 版本 | 拟制/修订责任人 | 拟制/修订日期 | 修订内容 | 审核人 | 批准人 |
+| --- | --- | --- | --- | --- | --- |
+| v1.0 | 张贵楠 | 2026/04/09 | 完成初稿 | 周侃 | 周侃 |
+
+
+| 场景 | 设备要求 |
+| --- | --- |
+| 单机 | Atlas800I A3、或Atlas800T A3 |
+| 双机 | 2台Atlas800I A3/ Atlas800T A3 |
+
+
+| 参数 | 参数说明 | 是否需要修改 |
+| --- | --- | --- |
+| ac1c767e5aa2 | 镜像ID | 否 |
+| glm5-v0.18.0rc1-a3 | 容器名称 | 可选 |
+| /data | 本地权重挂载路径 | 是 |
+
+
+| 环境变量 | 环境变量功能 | 是否修改 |
+| --- | --- | --- |
+| HCCL_BUFFSIZE | 用于控制两个NPU之间共享数据的缓存区大小。单位为M | 否 |
+| OMP_PROC_BIND | false：不绑定（线程可被操作系统调度到任意 CPU） | 否 |
+| OMP_NUM_THREADS | 多线程数 | 否 |
+| LLM_ASCEND_BALANCE_SCHEDULING | DP负载均衡 | 否 |
+
+
+| 参数 | 参数说明 | 是否修改 |
+| --- | --- | --- |
+| vllm serve /data/GLM-5-w8a8 | 指定加载的模型路径 | 是 |
+| --host 0.0.0.0 | 监听地址，0.0.0.0 表示对外提供服务 | 可选 |
+| --port 8077 | API 服务端口号 | 是 |
+| --data-parallel-size 2 | 数据并行（DP）规模，表示起 2 个 DP 副本 | 否 |
+| --tensor-parallel-size 8 | 张量并行（TP）大小，表示模型权重按 8 卡切分 | 否 |
+| --enable-expert-parallel | 使能专家并行 | 否 |
+| --seed 1024 | 随机种子，用于保证推理可复现 | 否 |
+| --quantization ascend | 使用昇腾量化算子 | 否 |
+| --trust-remote-code | 允许执行模型仓库中的自定义代码 | 否 |
+| --gpu-memory-utilization 0.92 | 限制显存最大使用比例为 92% | 可选 |
+| --served-model-name glm-5.1 | 对外服务时暴露的模型名称 | 是 |
+| --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}' | 推测解码配置：一次预测 3 个 token，使用 MTP 方法 | 否 |
+| --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' | 启用图编译模式，仅对 decode 阶段使用 CUDAGraph/ACL Graph | 否 |
+| --max-model-len 202752 | 支持的最大上下文长度（token 数），可以设置到202752 | 可选 |
+| --max-num-batched-tokens 8192 | 单次 batch 最大 token 总量 | 可选 |
+| --max-num-seqs 48 | 同时并发的最大请求序列数 | 可选 |
+| --async-scheduling | 启用异步调度，提高并发处理能力 | 否 |
+| --enable-chunked-prefill | 使能chunked prefill | 否 |
+| --enable-prefix-caching | 使能prefix cache | 否 |
+| --enable-auto-tool-choice \ --tool-call-parser glm47 \ --reasoning-parser glm45 \ | 启动Function Call | 否 |
+
+
+| 环境变量 | 环境变量功能 | 是否修改 |
+| --- | --- | --- |
+| nic_name | 指定通信使用的网卡名称（如 bond0、eth0），用于分布式通信和数据传输绑定到固定网卡。根据实际机器网卡名称修改。 | 是 |
+| local_ip | 当前节点（本机）的 IP 地址，用于 HCCL 等通信组件识别本节点网络地址。改为本机真实 IP。 | 是 |
+| node0_ip | 主节点（Master 节点）的 IP 地址，用于分布式集群中节点间通信定位。单机时与 local_ip 相同。集群部署时改为主节点 IP。 | 是 |
+| HCCL_OP_EXPANSION_MODE | 设置 HCCL（昇腾通信库）的算子扩展模式，AIV 表示启用算子融合与通信优化模式。 | 否 |
+| HCCL_IF_IP | 指定 HCCL 使用的本机 IP 地址，与 local_ip 绑定，避免选错通信网卡。 | 否 |
+| GLOO_SOCKET_IFNAME | 指定 PyTorch Gloo 后端通信所使用的网卡名称（用于进程间通信）。 | 否 |
+| TP_SOCKET_IFNAME | 指定 Tensor Parallel（张量并行）通信所使用的网卡名称。 | 否 |
+| HCCL_SOCKET_IFNAME | 指定 HCCL 通信所使用的网卡名称，保证多卡通信走指定物理网卡。 | 否 |
+| OMP_PROC_BIND | 控制 OpenMP 线程是否绑定到固定 CPU 核心，false 表示不强制绑定。 | 否 |
+| OMP_NUM_THREADS | 设置 OpenMP 线程数，影响 CPU 并行度（如 tokenizer、部分算子）。 | 否 |
+| HCCL_BUFFSIZE | 设置 HCCL 通信缓冲区大小（单位 MB），影响多卡通信吞吐与延迟。 | 可选 |
+| VLLM_ASCEND_BALANCE_SCHEDULING | 启用均衡调度功能，这可能有助于提高输出吞吐量并降低 v1 调度器中的 TPOT（每训练步吞吐量），但某些场景下可能会使 TTFT（训练时间）有所下降。此外，在 PD（参数服务器）分离的场景下，不建议启用此功能。 | 否 |
+| PYTORCH_NPU_ALLOC_CONF | 设置 NPU 内存分配策略，expandable_segments:True 表示允许内存段动态扩展，减少 OOM 风险。 | 否 |
+
+
+| 参数 | 参数说明 | 是否修改 |
+| --- | --- | --- |
+| vllm serve /data/GLM-5.1-w4a8 \ | 指定启动 vLLM 服务并加载的模型路径，需改为实际模型存放路径。 | 是 |
+| --host 0.0.0.0 | 服务监听地址，0.0.0.0 表示监听所有网卡 | 可选 |
+| --port 8077 | 服务监听端口，需改为实际端口 | 是 |
+| --data-parallel-size 2 | 数据并行总规模（DP 进程数） | 否 |
+| --data-parallel-size-local 1 | 当前节点上运行的 DP 进程数量 | 否 |
+| --data-parallel-address $node0_ip | 当前节点用于 DP 通信的 IP 地址 | 否 |
+| --data-parallel-rpc-port 13389 | 数据并行进程间通信使用的 RPC 端口，避免端口冲突 | 可选 |
+| --tensor-parallel-size 8 | 张量并行规模（TP 使用的卡数） | 否 |
+| --quantization ascend | 指定量化后端为 Ascend（昇腾） | 否 |
+| --seed 1024 | 随机种子，用于保证推理行为可复现 | 否 |
+| --served-model-name glm-5.1 | 对外服务时暴露的模型名称 | 可选 |
+| --enable-expert-parallel | 启用专家并行（用于 MoE 模型） | 否 |
+| --max-num-seqs 40 | 同时并发处理的最大请求序列数，与显存和并发需求相关，根据实际调整 | 可选 |
+| --max-model-len 202752 | 模型支持的最大上下文长度，与模型能力和显存相关 | 可选 |
+| --max-num-batched-tokens 4096 | 单批次最大 token 数，用于控制批处理规模，与性能和显存利用率相关 | 可选 |
+| --trust-remote-code | 允许执行模型仓库中的自定义代码 | 否 |
+| --gpu-memory-utilization 0.92 | 限制显存使用比例（92%）视情况修改（显存紧张或不稳定时可调低） | 可选 |
+| --enable-chunked-prefill | 使能chunked prefill | 否 |
+| --enable-prefix-caching | 使能prefix cache | 否 |
+| --async-scheduling | 开启异步调度 | 否 |
+| --enable-auto-tool-choice \ --tool-call-parser glm47 \ --reasoning-parser glm45 \ | 启动Function Call | 否 |
+| --additional-config '{"multistream_overlap_shared_expert":true, "fuse_qknorm_rope": false, "fuse_muls_add": true, "enable_npugraph_ex": true}' | 昇腾 NPU共享专家多流打开 算子融合优化开关打开 专属图编译优化打开 | 否 |
+| --compilation-config '{"cudagraph_capture_sizes": [1,4,8,12,16,20,24,28,32,36,40,48,56,64,80,96], "cudagraph_mode": "FULL_DECODE_ONLY"}' | 设置编译与图捕获策略，仅在解码阶段使用 CUDA Graph | 否 |
+| --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}' | 启用推测解码，指定每步推测 token 数和方法 | 否 |
+
+
+| 参数 | 参数说明 | 是否修改 |
+| --- | --- | --- |
+| --headless | 该实例将不启动 API 服务的 HTTP Server，而是作为一个纯粹的计算/推理工作负载节点运行 | 否 |
+| --data-parallel-start-rank | 当前物理节点在全局数据并行（DP）序列中的起始偏移量 | 否 |
+
+
+| 环境变量 | 环境变量功能 | 是否修改 |
+| --- | --- | --- |
+| nic_name | 指定通信使用的网卡名称（如 bond0、eth0），用于分布式通信和数据传输绑定到固定网卡。根据实际机器网卡名称修改。 | 是 |
+| local_ip | 当前节点（本机）的 IP 地址，用于 HCCL 等通信组件识别本节点网络地址。改为本机真实 IP。 | 是 |
+| node0_ip | 主节点（Master 节点）的 IP 地址，用于分布式集群中节点间通信定位。单机时与 local_ip 相同。集群部署时改为主节点 IP。 | 是 |
+| HCCL_OP_EXPANSION_MODE | 设置 HCCL（昇腾通信库）的算子扩展模式，AIV 表示启用算子融合与通信优化模式。 | 否 |
+| HCCL_IF_IP | 指定 HCCL 使用的本机 IP 地址，与 local_ip 绑定，避免选错通信网卡。 | 否 |
+| GLOO_SOCKET_IFNAME | 指定 PyTorch Gloo 后端通信所使用的网卡名称（用于进程间通信）。 | 否 |
+| TP_SOCKET_IFNAME | 指定 Tensor Parallel（张量并行）通信所使用的网卡名称。 | 否 |
+| HCCL_SOCKET_IFNAME | 指定 HCCL 通信所使用的网卡名称，保证多卡通信走指定物理网卡。 | 否 |
+| OMP_PROC_BIND | 控制 OpenMP 线程是否绑定到固定 CPU 核心，false 表示不强制绑定。 | 否 |
+| OMP_NUM_THREADS | 设置 OpenMP 线程数，影响 CPU 并行度（如 tokenizer、部分算子）。 | 否 |
+| HCCL_BUFFSIZE | 设置 HCCL 通信缓冲区大小（单位 MB），影响多卡通信吞吐与延迟。 | 可选 |
+| PYTORCH_NPU_ALLOC_CONF | 设置 NPU 内存分配策略，expandable_segments:True 表示允许内存段动态扩展，减少 OOM 风险。 | 否 |
+
+
+| 参数 | 参数说明 | 是否修改 |
+| --- | --- | --- |
+| vllm serve /data/GLM-5.1-w8a8 \ | 指定启动 vLLM 服务并加载的模型路径，需改为实际模型存放路径。 | 是 |
+| --host 0.0.0.0 | 服务监听地址，0.0.0.0 表示监听所有网卡 | 可选 |
+| --port 8077 | 服务监听端口，需改为实际端口 | 是 |
+| --data-parallel-size 4 | 数据并行总规模（DP 进程数） | 否 |
+| --data-parallel-size-local 2 | 当前节点上运行的 DP 进程数量 | 否 |
+| --data-parallel-address $local_ip | 当前节点用于 DP 通信的 IP 地址 | 否 |
+| --data-parallel-rpc-port 12890 | 数据并行进程间通信使用的 RPC 端口，避免端口冲突 | 可选 |
+| --tensor-parallel-size 8 | 张量并行规模（TP 使用的卡数） | 否 |
+| --quantization ascend | 指定量化后端为 Ascend（昇腾） | 否 |
+| --seed 1024 | 随机种子，用于保证推理行为可复现 | 否 |
+| --served-model-name glm-5.1 | 对外服务时暴露的模型名称 | 可选 |
+| --enable-expert-parallel | 启用专家并行（用于 MoE 模型） | 否 |
+| --max-num-seqs 16 | 同时并发处理的最大请求序列数，与显存和并发需求相关，根据实际调整 | 可选 |
+| --max-model-len 202752 | 模型支持的最大上下文长度，与模型能力和显存相关 | 可选 |
+| --max-num-batched-tokens 4096 | 单批次最大 token 数，用于控制批处理规模，与性能和显存利用率相关 | 可选 |
+| --trust-remote-code | 允许执行模型仓库中的自定义代码 | 否 |
+| --gpu-memory-utilization | 限制显存使用比例视情况修改（显存紧张或不稳定时可调低） | 可选 |
+| --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' | 设置编译与图捕获策略，仅在解码阶段使用 CUDA Graph | 否 |
+| --additional-config '{"enable_npugraph_ex": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":true}' \ | 昇腾 NPU 专属图编译优化打开 算子融合优化开关打开 专家多流打开 | 否 |
+| --async-scheduling | 开启异步调度 | 否 |
+| --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}' | 启用推测解码，指定每步推测 token 数和方法 | 否 |
+| --enable-auto-tool-choice \ --tool-call-parser glm47 \ --reasoning-parser glm45 \ | 启动Function Call | 否 |
+
+
+| 参数 | 参数说明 | 是否修改 |
+| --- | --- | --- |
+| --headless | 该实例将不启动 API 服务的 HTTP Server，而是作为一个纯粹的计算/推理工作负载节点运行 | 否 |
+| --data-parallel-start-rank | 当前物理节点在全局数据并行（DP）序列中的起始偏移量 | 否 |
+
+
+| 参数名称 | 含义 |
+| --- | --- |
+| --dp-size | 全局数据并行总数（必填） |
+| --tp-size | 张量并行大小（默认 1） |
+| --dp-size-local | 本机启动的 DP 数量（默认等于 dp-size） |
+| --dp-rank-start | 本机 DP rank 起始编号（默认 0） |
+| --dp-address | DP 主节点 IP（必填） |
+| --dp-rpc-port | DP 主节点通信端口（默认 12345） |
+| --vllm-start-port | vLLM 推理服务起始端口（默认 9000），会从此端口开始，每增加一个dp，就增加一个开放端口。 举例：vllm-start-port = 3000，dp-size-local = 16 会开放本节点的 3000,3001,…3015端口进行通信 |
+
+
+| 环境变量 | 环境变量功能 | 是否修改 |
+| --- | --- | --- |
+| nic_name | 指定通信网卡名称（如 bond0 或 eth0）。需根据实际物理网卡名修改。 | 是 |
+| local_ip | 当前节点的业务 IP 地址，，需改为本机实际 IP。 | 是 |
+| VLLM_ASCEND_ENABLE_FUSED_MC2 | 开启Multi-Core Collective Communication融合算子 | 否 |
+| HCCL_IF_IP | HCCL 集合通信使用的 IP 地址。 | 否 |
+| GLOO_SOCKET_IFNAME | Gloo 通信框架使用的网卡接口。 | 否 |
+| TP_SOCKET_IFNAME | Tensor Parallel（张量并行）通信使用的网卡接口。 | 否 |
+| HCCL_SOCKET_IFNAME | HCCL 集合通信使用的网卡接口。 | 否 |
+| OMP_PROC_BIND | 控制 OpenMP 线程是否绑定到固定 CPU 核心，false 表示不强制绑定。 | 否 |
+| HCCL_OP_EXPANSION_MODE | 设置为 AIV，表示开启 AIV 算子展开模式，优化昇腾算子性能。 | 否 |
+| OMP_NUM_THREADS | 设置 OpenMP 并行线程数。 | 否 |
+| PYTORCH_NPU_ALLOC_CONF | 昇腾 NPU 内存分配策略，expandable_segments:True 有助于防止内存碎片。 | 否。 |
+| ASCEND_RT_VISIBLE_DEVICES | 指定当前脚本可见的 NPU 芯片 ID（通过脚本第一个参数 $1 传入）。 | 否 |
+| VLLM_ASCEND_ENABLE_FLASHCOMM1 | 开启昇腾 FlashComm 通信优化。 | 否 |
+| VLLM_NIXL_ABORT_REQUEST_TIMEOUT | 设置通信请求超时时间（单位：毫秒）。 | 否 |
+| ASCEND_AGGREGATE_ENABLE | 启用 HCCL 通信聚合优化 | 否 |
+| ACL_OP_INIT_MODE | 昇腾算子初始化模式，=1延迟初始化算子 | 否 |
+| ASCEND_A3_ENABLE | 强制开启昇腾 A3 芯片硬件特性 | 否 |
+
+
+| 参数 | 参数说明 | 是否修改 |
+| --- | --- | --- |
+| vllm serve /data/GLM-5.1-w8a8 \ | 模型路径：指定本地或挂载的存储路径。需指向实际模型目录。 | 是 |
+| --host | 服务监听地址，0.0.0.0 表示允许外部访问。 | 否。 |
+| --port | 推理接口访问端口，多个实例需分配不同端口。 | 是 |
+| --data-parallel-size | 数据并行大小：模型副本的总数（对应 $3）。 | 否 |
+| --data-parallel-rank | 数据并行排名：当前副本在 DP 组中的 ID（对应 $4）。 | 否 |
+| --data-parallel-address | 数据并行通信地址：主节点 IP | 是 |
+| --data-parallel-rpc-port | 数据并行 RPC 端口：跨节点通信端口，需确保防火墙放行。 | 是 |
+| --tensor-parallel-size | 张量并行大小：单副本拆分的 NPU 数量（对应 $7）。 | 否 |
+| --enable-expert-parallel | 专家并行：MoE 架构（如 DeepSeek）的并行优化开关。 | 否 |
+| --speculative-config | 投机采样配置：包含 num_speculative_tokens (2) 和方法 deepseek_mtp（多标记预测）。 | 否 |
+| --profiler-config | 性能分析配置：使用 torch profiler 记录算子执行详情。 | 调试时开启，正式环境建议关闭。 |
+| --seed | 随机种子，设置为 1024 以保证推理结果一致性。 | 否 |
+| --served-model-name | 接口显示的自定义模型名称。 | 是 |
+| --max-model-len | 最大上下文长度，根据实际情况调整。 | 可选 |
+| --max-num-batched-tokens | 批次处理的最大 token 总数，直接影响吞吐量和显存占用。根据实际情况调整。 | 可选 |
+| --trust-remote-code | 信任并执行模型仓库中的自定义 Python 脚本。 | 否 |
+| --max-num-seqs | 最大并发请求序列数，建议根据 QPS 需求调整。 | 可选 |
+| --gpu-memory-utilization | 显存利用率：设置 NPU 显存的最大占用比例，需在性能与稳定性间平衡。。 | 可选 |
+| --quantization | 量化类型，此处指定为昇腾特化的 ascend 方案。 | 否 |
+| --enforce-eager | 强制使用 Eager 模式，不使用图形编译，降低启动耗时但可能牺牲性能。 | 否 |
+| --additional-config '{"enable_npugraph_ex": true, "fuse_muls_add":true,"multistream_overlap_shared_expert":true,"recompute_scheduler_enable" : true}' \ | 昇腾 NPU 专属图编译优化打开 算子融合优化开关打开 共享专家多流打开 用重新计算调度器 | 否 |
+| --kv-transfer-config | KV 缓存转移配置：配置 Mooncake 连接器，定义 Prefill/Decode 分离架构下的 DP/TP 映射关系，注意端口需要防火墙开启。 | 否 |
+| --enable-auto-tool-choice \ --tool-call-parser glm47 \ --reasoning-parser glm45 \ | 启动Function Call | 否 |
+
+
+| 参数名称 | 含义 | 是否修改 |
+| --- | --- | --- |
+| --dp-size | 全局数据并行总数（必填） | 否 |
+| --tp-size | 张量并行大小（默认 1） | 否 |
+| --dp-size-local | 本机启动的 DP 数量（默认等于 dp-size） | 否 |
+| --dp-rank-start | 本机 DP rank 起始编号（默认 0） | 否 |
+| --dp-address | DP 主节点 IP（必填），根据现网实际IP地址修改为对应实例的主节点业务IP，举例子，P实例是1个节点，就用此节点的IP。D实例是2个节点，使用主节点的IP | 是 |
+| --dp-rpc-port | DP 主节点通信端口（默认 12345），注意防火墙开启此端口 | 可选 |
+| --vllm-start-port | vLLM 推理服务起始端口（默认 9000），会从此端口开始，本节点每增加一个dp，就增加一个开放端口。共计开放dp-size-local个端口 举例：vllm-start-port = 3000，dp-size-local = 16 会开放本节点的 3000,3001,…3015端口进行通信，注意防火墙开启此端口 | 可选 |
+
+
+| 参数 | 参数说明 | 参数修改说明 |
+| --- | --- | --- |
+| --host | 代理服务器监听地址。指该 Python 脚本运行所在的 IP 地址，用于接收客户端请求。 | 示例中修改为 100.100.135.153。若在本地测试可设为 127.0.0.1，若对外提供服务需设为实际物理 IP。 |
+| --port | 代理服务器监听端口。代理服务对外暴露的 HTTP 服务端口。 | 示例中修改为 1999。需确保该端口未被占用且防火墙已放行。 |
+| --prefiller-hosts | Prefiller 节点主机列表。负责处理 Prompt 预填充阶段的服务端 IP 地址，支持配置多个以实现负载均衡。 | 示例中配置了 2 个节点：100.100.135.156 和 100.100.135.160。参数间以空格分隔。对应DP数量地址。 |
+| --prefiller-ports | Prefiller 节点端口列表。对应上述主机列表的端口号，数量必须与主机列表一致。 | 示例中均设为 9100。脚本会按顺序将主机与端口配对。本节点DP数量个端口。 |
+| --decoder-hosts | Decoder 节点主机列表。负责处理 Token 生成阶段的服务端 IP 地址。 | 示例中配置了 8 个实例，分别分布在 ...153 和 ...154 两台机器上。适用于计算密集型的解码阶段。对应DP数量地址。 |
+| --decoder-ports | Decoder 节点端口列表。对应上述解码节点主机的端口号。 | 示例中展示了在单台机器上运行多个端口（如 9100-9103）来充分利用多显卡/多实例资源。本节点DP数量个端口 |
+
+
+| 参数名称 | 含义 |
+| --- | --- |
+| --dp-size | 全局数据并行总数（必填） |
+| --tp-size | 张量并行大小（默认 1） |
+| --dp-size-local | 本机启动的 DP 数量（默认等于 dp-size） |
+| --dp-rank-start | 本机 DP rank 起始编号（默认 0） |
+| --dp-address | DP 主节点 IP（必填） |
+| --dp-rpc-port | DP 主节点通信端口（默认 12345） |
+| --vllm-start-port | vLLM 推理服务起始端口（默认 9000），会从此端口开始，每增加一个dp，就增加一个开放端口。 举例：vllm-start-port = 3000，dp-size-local = 16 会开放本节点的 3000,3001,…3015端口进行通信 |
+
+
+| 环境变量 | 环境变量功能 | 是否修改 |
+| --- | --- | --- |
+| nic_name | 指定通信网卡名称（如 bond0 或 eth0）。需根据实际物理网卡名修改。 | 是 |
+| local_ip | 当前节点的业务 IP 地址，，需改为本机实际 IP。 | 是 |
+| VLLM_ASCEND_ENABLE_FUSED_MC2 | 开启Multi-Core Collective Communication融合算子 | 否 |
+| HCCL_IF_IP | HCCL 集合通信使用的 IP 地址。 | 否 |
+| GLOO_SOCKET_IFNAME | Gloo 通信框架使用的网卡接口。 | 否 |
+| TP_SOCKET_IFNAME | Tensor Parallel（张量并行）通信使用的网卡接口。 | 否 |
+| HCCL_SOCKET_IFNAME | HCCL 集合通信使用的网卡接口。 | 否 |
+| OMP_PROC_BIND | 控制 OpenMP 线程是否绑定到固定 CPU 核心，false 表示不强制绑定。 | 否 |
+| HCCL_OP_EXPANSION_MODE | 设置为 AIV，表示开启 AIV 算子展开模式，优化昇腾算子性能。 | 否 |
+| OMP_NUM_THREADS | 设置 OpenMP 并行线程数。 | 否 |
+| PYTORCH_NPU_ALLOC_CONF | 昇腾 NPU 内存分配策略，expandable_segments:True 有助于防止内存碎片。 | 否。 |
+| ASCEND_RT_VISIBLE_DEVICES | 指定当前脚本可见的 NPU 芯片 ID（通过脚本第一个参数 $1 传入）。 | 否 |
+| VLLM_ASCEND_ENABLE_FLASHCOMM1 | 开启昇腾 FlashComm 通信优化。 | 否 |
+| VLLM_NIXL_ABORT_REQUEST_TIMEOUT | 设置通信请求超时时间（单位：毫秒）。 | 否 |
+| ASCEND_AGGREGATE_ENABLE | 启用 HCCL 通信聚合优化 | 否 |
+| ACL_OP_INIT_MODE | 昇腾算子初始化模式，=1延迟初始化算子 | 否 |
+| ASCEND_A3_ENABLE | 强制开启昇腾 A3 芯片硬件特性 | 否 |
+
+
+| 参数 | 参数说明 | 是否修改 |
+| --- | --- | --- |
+| vllm serve /data/GLM-5.1-w8a8 \ | 模型路径：指定本地或挂载的存储路径。需指向实际模型目录。 | 是 |
+| --host | 服务监听地址，0.0.0.0 表示允许外部访问。 | 否。 |
+| --port | 推理接口访问端口，多个实例需分配不同端口。 | 是 |
+| --data-parallel-size | 数据并行大小：模型副本的总数（对应 $3）。 | 否 |
+| --data-parallel-rank | 数据并行排名：当前副本在 DP 组中的 ID（对应 $4）。 | 否 |
+| --data-parallel-address | 数据并行通信地址：主节点 IP | 是 |
+| --data-parallel-rpc-port | 数据并行 RPC 端口：跨节点通信端口，需确保防火墙放行。 | 是 |
+| --tensor-parallel-size | 张量并行大小：单副本拆分的 NPU 数量（对应 $7）。 | 否 |
+| --enable-expert-parallel | 专家并行：MoE 架构（如 DeepSeek）的并行优化开关。 | 否 |
+| --speculative-config | 投机采样配置：包含 num_speculative_tokens (2) 和方法 deepseek_mtp（多标记预测）。 | 否 |
+| --profiler-config | 性能分析配置：使用 torch profiler 记录算子执行详情。 | 调试时开启，正式环境建议关闭。 |
+| --seed | 随机种子，设置为 1024 以保证推理结果一致性。 | 否 |
+| --served-model-name | 接口显示的自定义模型名称。 | 是 |
+| --max-model-len | 最大上下文长度，根据实际情况调整。 | 可选 |
+| --max-num-batched-tokens | 批次处理的最大 token 总数，直接影响吞吐量和显存占用。根据实际情况调整。 | 可选 |
+| --trust-remote-code | 信任并执行模型仓库中的自定义 Python 脚本。 | 否 |
+| --max-num-seqs | 最大并发请求序列数，建议根据 QPS 需求调整。 | 可选 |
+| --gpu-memory-utilization | 显存利用率：设置 NPU 显存的最大占用比例，需在性能与稳定性间平衡。。 | 可选 |
+| --quantization | 量化类型，此处指定为昇腾特化的 ascend 方案。 | 否 |
+| --enforce-eager | 强制使用 Eager 模式，不使用图形编译，降低启动耗时但可能牺牲性能。 | 否 |
+| --additional-config '{"enable_npugraph_ex": true, "fuse_muls_add":true,"multistream_overlap_shared_expert":true,"recompute_scheduler_enable" : true}' \ | 昇腾 NPU 专属图编译优化打开 算子融合优化开关打开 共享专家多流打开 用重新计算调度器 | 否 |
+| --kv-transfer-config | KV 缓存转移配置：配置 Mooncake 连接器，定义 Prefill/Decode 分离架构下的 DP/TP 映射关系，注意端口需要防火墙开启。 | 否 |
+| --enable-auto-tool-choice \ --tool-call-parser glm47 \ --reasoning-parser glm45 \ | 启动Function Call | 否 |
+
+
+| 参数名称 | 含义 | 是否修改 |
+| --- | --- | --- |
+| --dp-size | 全局数据并行总数（必填） | 否 |
+| --tp-size | 张量并行大小（默认 1） | 否 |
+| --dp-size-local | 本机启动的 DP 数量（默认等于 dp-size） | 否 |
+| --dp-rank-start | 本机 DP rank 起始编号（默认 0） | 否 |
+| --dp-address | DP 主节点 IP（必填），根据现网实际IP地址修改为对应实例的主节点业务IP，举例子，P实例是1个节点，就用此节点的IP。D实例是2个节点，使用主节点的IP | 是 |
+| --dp-rpc-port | DP 主节点通信端口（默认 12345），注意防火墙开启此端口 | 可选 |
+| --vllm-start-port | vLLM 推理服务起始端口（默认 9000），会从此端口开始，本节点每增加一个dp，就增加一个开放端口。共计开放dp-size-local个端口 举例：vllm-start-port = 3000，dp-size-local = 16 会开放本节点的 3000,3001,…3015端口进行通信，注意防火墙开启此端口 | 可选 |
+
+
+| 参数 | 参数说明 | 参数修改说明 |
+| --- | --- | --- |
+| --host | 代理服务器监听地址。指该 Python 脚本运行所在的 IP 地址，用于接收客户端请求。 | 示例中修改为 100.100.135.153。若在本地测试可设为 127.0.0.1，若对外提供服务需设为实际物理 IP。 |
+| --port | 代理服务器监听端口。代理服务对外暴露的 HTTP 服务端口。 | 示例中修改为 1999。需确保该端口未被占用且防火墙已放行。 |
+| --prefiller-hosts | Prefiller 节点主机列表。负责处理 Prompt 预填充阶段的服务端 IP 地址，支持配置多个以实现负载均衡。 | 示例中配置了 2 个节点：100.100.135.156 和 100.100.135.160。参数间以空格分隔。对应DP数量地址。 |
+| --prefiller-ports | Prefiller 节点端口列表。对应上述主机列表的端口号，数量必须与主机列表一致。 | 示例中均设为 9100。脚本会按顺序将主机与端口配对。本节点DP数量个端口。 |
+| --decoder-hosts | Decoder 节点主机列表。负责处理 Token 生成阶段的服务端 IP 地址。 | 示例中配置了 8 个实例，分别分布在 ...153 和 ...154 两台机器上。适用于计算密集型的解码阶段。对应DP数量地址。 |
+| --decoder-ports | Decoder 节点端口列表。对应上述解码节点主机的端口号。 | 示例中展示了在单台机器上运行多个端口（如 9100-9103）来充分利用多显卡/多实例资源。本节点DP数量个端口 |
+
+
+| 数据集类别 | 数据集名称 | 精度结果 | 精度结果 |
+| --- | --- | --- | --- |
+| 数学推理 | aime2025 | 96.67 | 96.67 |
+| 科学任务 | GPQA_diamond | 89.9 | 89.9 |
+| 代码生成 | AutoCodeBench | java | 63.3 |
+| 代码生成 | AutoCodeBench | javascript | 70.2 |
+| 代码生成 | AutoCodeBench | typescript | 75.8 |
+| 指令遵循 | ifeval | Prompt-level-strict-accuracy | 93.53 |
+| 指令遵循 | ifeval | Inst-level-strict-accuracy | 95.68 |
+| 指令遵循 | ifeval | Prompt-level-loose-accuracy | 95.19 |
+| 指令遵循 | ifeval | Inst-level-loose-accuracy | 96.88 |

@@ -26,6 +26,8 @@
 > ```
 >
 > 这三个 patch 文件需要单独提供，并上传到上述目录。其中，`0001-Bugfix-Fix-negative-local_cache_hit-in-P-D-disaggreg.patch` 需要打到 `/vllm-workspace/vllm` 仓库下，用于修复 `local_cache_hit` 指标出现负值的问题；`0001-Implement-yuanrong-backend.patch` 用于补充 Yuanrong backend 支持；`0001-BugFix-0.18.0-KV-Pool-Fix-KV-Pool-not-putting-kv-cac.patch` 用于修复 vLLM v0.18.0 在 speculative decoding 场景下 KV Pool 未正确执行 KV Cache put / finalize 的问题，并规避后续 vLLM metrics 统计相关报错。若环境中已包含这些 patch 的改动，可跳过此步骤。
+>
+> **W4A8 限制说明**：A3 上 `VLLM_ASCEND_ENABLE_FUSED_MC2=1/2` 当前只支持 `W8A8` 的 MoE 融合路径。部署 `GLM-5-w4a8` 时请保持 `VLLM_ASCEND_ENABLE_FUSED_MC2=0` 或不设置，否则可能触发 `aclnnDispatchFFNCombineBF16` 入参类型不匹配报错。
 
 ## 环境准备
 
@@ -180,7 +182,6 @@ export SHM_SIZE=512000
 export NODE_TIMEOUT=30
 export NODE_DEAD_TIMEOUT=60
 export LIVENESS_PATH=/workspace/liveness
-mkdir -p ${LIVENESS_PATH}
 
 etcd \
   --name etcd-single \
@@ -221,7 +222,6 @@ export SHM_SIZE=512000
 export NODE_TIMEOUT=30
 export NODE_DEAD_TIMEOUT=60
 export LIVENESS_PATH=/workspace/liveness
-mkdir -p ${LIVENESS_PATH}
 
 dscli start -w \
   --worker_address ${HOST_IP}:${WORKER_PORT} \
@@ -290,7 +290,7 @@ A3 节点默认使用 16 个 NPU device。Mooncake 使用 AscendDirectTransport 
 # 网络配置 - 按实际环境修改
 nic_name="enp67s0f0np0"
 local_ip="192.168.10.10"
-export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export VLLM_ASCEND_ENABLE_FUSED_MC2=0
 export HCCL_OP_EXPANSION_MODE="AIV"
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
 
@@ -421,7 +421,7 @@ python launch_online_dp.py \
 # 网络配置 - 按实际环境修改
 nic_name="enp67s0f0np0"
 local_ip="192.168.10.11"
-export VLLM_ASCEND_ENABLE_FUSED_MC2=1
+export VLLM_ASCEND_ENABLE_FUSED_MC2=0
 export HCCL_OP_EXPANSION_MODE="AIV"
 
 export HCCL_IF_IP=$local_ip
@@ -592,6 +592,7 @@ bash proxy.sh > proxy.log 2>&1 &
 | `lookup_rpc_port` | `$4` | 直接复用当前 DP rank，保证同机唯一 |
 | `engine_id` | `$4` | 建议与当前 DP rank 保持一致，便于排障 |
 | `ASCEND_ENABLE_USE_FABRIC_MEM` | `1` | A3 推荐配置，开启统一地址直传 |
+| `VLLM_ASCEND_ENABLE_FUSED_MC2` | `0` | `GLM-5-w4a8` 在 A3 双机 PD 场景必须关闭融合 MC2 |
 | `PYTHONHASHSEED` | `0` | 两个节点必须保持一致，确保 KV Cache 键一致性 |
 
 ### MultiConnector 配置要点
@@ -689,21 +690,29 @@ bash tools/watch_cache_hit_rate.sh -u http://192.168.10.11:6600/metrics -i 10
 
    确认 `lookup_rpc_port` 没有写死成同一个值。本文示例直接使用 `$4`，即当前 DP rank。
 
-5. **KV Cache 未命中或命中率异常低**
+5. **启动后报 `aclnnDispatchFFNCombineBF16` 或 `Io input dtype or format is not supported`**
+
+   这是 `W4A8` 权重误走了 A3 上仅支持 `W8A8` 的融合 MoE 路径。检查两个节点是否都保持：
+   ```bash
+   echo $VLLM_ASCEND_ENABLE_FUSED_MC2
+   ```
+   对于本文场景应为 `0` 或空值。
+
+6. **KV Cache 未命中或命中率异常低**
 
    确认两个节点都设置了相同的哈希种子：
    ```bash
    echo $PYTHONHASHSEED
    ```
 
-6. **引擎启动超时**
+7. **引擎启动超时**
 
    可以先放宽等待时间：
    ```bash
    export VLLM_ENGINE_READY_TIMEOUT_S=3600
    ```
 
-7. **节点时间不一致**
+8. **节点时间不一致**
 
    双机场景下建议两个节点的系统时间保持一致：
    ```bash
@@ -714,7 +723,7 @@ bash tools/watch_cache_hit_rate.sh -u http://192.168.10.11:6600/metrics -i 10
 ## 参考资料
 
 - [基于 Yuanrong 的 GLM-5 W4A8 单实例部署](pd_colocated_yuanrong_glm5_cn.md)
-- [基于 Yuanrong 的 GLM-5 W8A8 8机 A2 大EP PD分离部署](pd_disagg_yuanrong_glm5_cn.md)
+- [基于 Yuanrong 的 GLM-5 W8A8 A3 双机 PD 分离部署](pd_disagg_yuanrong_glm5_w8a8_a3_dual_node_cn.md)
 - [external_online_dp README](https://github.com/vllm-project/vllm-ascend/blob/main/examples/external_online_dp/README.md)
 - [Yuanrong Datasystem 文档](https://atomgit.com/openeuler/yuanrong-datasystem)
 - [etcd 文档](https://etcd.io/docs/)
