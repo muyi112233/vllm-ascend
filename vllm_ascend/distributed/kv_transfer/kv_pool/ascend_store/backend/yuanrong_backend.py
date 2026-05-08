@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 from vllm.config import ParallelConfig
+from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 from vllm.utils.network_utils import split_host_port
 
@@ -89,7 +90,7 @@ class YuanrongBackend(Backend):
         except ImportError as exc:
             raise ImportError("Please install openyuanrong-datasystem to use the yuanrong backend.") from exc
 
-        self.rank = parallel_config.rank
+        self.local_rank = get_world_group().local_rank
         self._helper = YuanrongHelper(Blob, DeviceBlobList)
         self._ds_set_param = SetParam()
         self._ds_set_param.write_mode = WriteMode.NONE_L2_CACHE_EVICT
@@ -112,7 +113,7 @@ class YuanrongBackend(Backend):
             self.set_device()
 
     def set_device(self):
-        device = torch.device(f"npu:{self.rank}")
+        device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
         self._helper._device_id = int(torch.npu.current_device())
 
