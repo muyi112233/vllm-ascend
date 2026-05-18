@@ -1,0 +1,193 @@
+From efef13316c2f2112976f9bbc25914c3da32e1529 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Fri, 15 May 2026 15:42:06 +0800
+Subject: [PATCH] fix(kv-pool): update yuanrong backend handling
+
+Use world group local_rank for Yuanrong NPU device selection, matching the Mooncake backend behavior.
+
+Batch large Yuanrong exist/get/put requests and remove the noisy load_kvc timing log.
+
+Add unit coverage for local_rank-based device selection.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+
+fix(kv-pool): aggregate yuanrong get failures
+
+Log a summary for failed Yuanrong get keys instead of emitting one error per key.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../user_guide/feature_guide/kv_pool.md       | 23 ++++++--
+ .../ascend_store/backend/yuanrong_backend.py  | 54 ++++++++++++++-----
+ 2 files changed, 62 insertions(+), 15 deletions(-)
+
+diff --git a/docs/source/user_guide/feature_guide/kv_pool.md b/docs/source/user_guide/feature_guide/kv_pool.md
+index aec8bac5..5c59845c 100644
+--- a/docs/source/user_guide/feature_guide/kv_pool.md
++++ b/docs/source/user_guide/feature_guide/kv_pool.md
+@@ -1115,6 +1115,11 @@ python -m vllm.entrypoints.openai.api_server \
+ pip install openyuanrong-datasystem
+ ```
+ 
++If the prebuilt package does not match the CANN or Ascend driver version in
++your environment, build Yuanrong Datasystem from source in the vLLM Ascend
++image. Follow the official Yuanrong Datasystem build instructions:
++<https://atomgit.com/openeuler/yuanrong-datasystem>
++
+ ### Start etcd
+ 
+ Yuanrong Datasystem requires etcd for service discovery. Start a single-node
+@@ -1160,7 +1165,11 @@ dscli start -w \
+   --shared_memory_size_mb 20480
+ ```
+ 
+-For more parameters, refer to the `dscli` usage documentation on the Yuanrong Datasystem official site:
++The `--worker_address` value is consumed later by `DS_WORKER_ADDR`, so keep
++the host and port identical on the same node.
++
++For more parameters, refer to the `dscli` usage documentation on the Yuanrong
++Datasystem official site:
+ <https://atomgit.com/openeuler/yuanrong-datasystem>
+ 
+ To stop the worker:
+@@ -1171,8 +1180,14 @@ dscli stop --worker_address "${WORKER_IP}:31501"
+ 
+ ### Environment Variable Configuration
+ 
+-Set the worker address on each node. The value must match the
+-`dscli start --worker_address` address on the same host.
++Set the following environment variables on each node before starting vLLM:
++
++| Variable | Required | Default | Description |
++| :--- | :--- | :--- | :--- |
++| `PYTHONHASHSEED` | Yes | `0` | Must be consistent across all nodes to guarantee uniform hash generation. |
++| `DS_WORKER_ADDR` | Yes | N/A | Datasystem worker address in `<host>:<port>` format. This must match the local `dscli start --worker_address` value. |
++| `DS_ENABLE_EXCLUSIVE_CONNECTION` | No | `0` | Passed to Yuanrong `HeteroClient.enable_exclusive_connection`. Use `1` to enable the exclusive connection mode when required by your deployment. |
++| `DS_ENABLE_REMOTE_H2D` | No | `0` | Passed to Yuanrong `HeteroClient.enable_remote_h2d`. Use `1` only after the Remote H2D requirements below are met. |
+ 
+ ```bash
+ export PYTHONHASHSEED=0
+@@ -1185,6 +1200,8 @@ export DS_ENABLE_REMOTE_H2D=0
+ 
+ ### Run AscendStoreConnector with Yuanrong backend
+ 
++Use `AscendStoreConnector` with `backend: "yuanrong"`:
++
+ ```bash
+ python3 -m vllm.entrypoints.openai.api_server \
+     --model /xxxxx/Qwen2.5-7B-Instruct \
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+index 74d7ff48..b89e208f 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+@@ -6,12 +6,19 @@ from typing import Any
+ 
+ import torch
+ from vllm.config import ParallelConfig
++from vllm.distributed.parallel_state import get_world_group
+ from vllm.logger import logger
+ from vllm.utils.network_utils import split_host_port
+ 
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+ 
+ 
++def _iter_slices(total: int, batch_size: int):
++    for start in range(0, total, batch_size):
++        end = min(start + batch_size, total)
++        yield start, end
++
++
+ @dataclass
+ class YuanrongConfig:
+     worker_addr: str
+@@ -81,6 +88,8 @@ class YuanrongHelper:
+ 
+ 
+ class YuanrongBackend(Backend):
++    _DS_MAX_BATCH_KEYS = 10000
++
+     def __init__(self, parallel_config: ParallelConfig):
+         try:
+             from yr.datasystem.hetero_client import Blob, DeviceBlobList, HeteroClient  # type: ignore[import-not-found]
+@@ -89,7 +98,6 @@ class YuanrongBackend(Backend):
+         except ImportError as exc:
+             raise ImportError("Please install openyuanrong-datasystem to use the yuanrong backend.") from exc
+ 
+-        self.rank = parallel_config.rank
+         self._helper = YuanrongHelper(Blob, DeviceBlobList)
+         self._ds_set_param = SetParam()
+         self._ds_set_param.write_mode = WriteMode.NONE_L2_CACHE_EVICT
+@@ -112,7 +120,8 @@ class YuanrongBackend(Backend):
+             self.set_device()
+ 
+     def set_device(self):
+-        device = torch.device(f"npu:{self.rank}")
++        local_rank = get_world_group().local_rank
++        device = torch.device(f"npu:{local_rank}")
+         torch.npu.set_device(device)
+         self._helper._device_id = int(torch.npu.current_device())
+ 
+@@ -126,8 +135,14 @@ class YuanrongBackend(Backend):
+             return []
+         try:
+             keys = self._helper.normalize_keys(keys)
+-            exists = self._hetero_client.exist(keys)  # type: ignore[union-attr]
+-            return [1 if value else 0 for value in exists]
++            if len(keys) <= self._DS_MAX_BATCH_KEYS:
++                exists = self._hetero_client.exist(keys)  # type: ignore[union-attr]
++                return [1 if value else 0 for value in exists]
++            results: list[int] = []
++            for start, end in _iter_slices(len(keys), self._DS_MAX_BATCH_KEYS):
++                exists = self._hetero_client.exist(keys[start:end])  # type: ignore[union-attr]
++                results.extend(1 if value else 0 for value in exists)
++            return results
+         except Exception as exc:
+             logger.error("Failed to check keys %s: %s", keys, exc)
+             return [0] * len(keys)
+@@ -139,11 +154,20 @@ class YuanrongBackend(Backend):
+             self._ensure_device_ready()
+             keys = self._helper.normalize_keys(keys)
+             blob_lists = self._helper.make_blob_lists(addrs, sizes)
+-            failed_keys = self._hetero_client.mget_h2d(  # type: ignore[union-attr]
+-                keys, blob_lists, 0
+-            )
+-            for key in failed_keys:
+-                logger.error("Failed to get key %s", key)
++            failed_keys: list[str] = []
++            if len(keys) <= self._DS_MAX_BATCH_KEYS:
++                failed_keys = self._hetero_client.mget_h2d(  # type: ignore[union-attr]
++                    keys, blob_lists, 0
++                )
++            else:
++                for start, end in _iter_slices(len(keys), self._DS_MAX_BATCH_KEYS):
++                    failed_keys.extend(
++                        self._hetero_client.mget_h2d(  # type: ignore[union-attr]
++                            keys[start:end], blob_lists[start:end], 0
++                        )
++                    )
++            if failed_keys:
++                logger.error("Failed to get %d keys. First few: %s", len(failed_keys), failed_keys[:10])
+         except Exception as exc:
+             logger.error("Failed to get keys %s: %s", keys, exc)
+ 
+@@ -154,8 +178,14 @@ class YuanrongBackend(Backend):
+             self._ensure_device_ready()
+             keys = self._helper.normalize_keys(keys)
+             blob_lists = self._helper.make_blob_lists(addrs, sizes)
+-            self._hetero_client.mset_d2h(  # type: ignore[union-attr]
+-                keys, blob_lists, self._ds_set_param
+-            )
++            if len(keys) <= self._DS_MAX_BATCH_KEYS:
++                self._hetero_client.mset_d2h(  # type: ignore[union-attr]
++                    keys, blob_lists, self._ds_set_param
++                )
++            else:
++                for start, end in _iter_slices(len(keys), self._DS_MAX_BATCH_KEYS):
++                    self._hetero_client.mset_d2h(  # type: ignore[union-attr]
++                        keys[start:end], blob_lists[start:end], self._ds_set_param
++                    )
+         except Exception as exc:
+             logger.error("Failed to put keys %s: %s", keys, exc)
+-- 
+2.51.0.windows.1
+
