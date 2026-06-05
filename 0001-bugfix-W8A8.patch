@@ -1,0 +1,325 @@
+From cad0e01ec416796130be9ad27443ea18a07ce53b Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Fri, 5 Jun 2026 16:13:08 +0800
+Subject: [PATCH] bugfix W8A8
+
+---
+ .../rfork/test_transfer_backend.py            | 98 +++++++++++++++++++
+ .../model_loader/rfork/rfork_loader.py        | 13 ++-
+ .../model_loader/rfork/rfork_worker.py        |  8 ++
+ .../model_loader/rfork/transfer_backend.py    | 78 ++++++++++++++-
+ 4 files changed, 193 insertions(+), 4 deletions(-)
+ create mode 100644 tests/ut/model_loader/rfork/test_transfer_backend.py
+
+diff --git a/tests/ut/model_loader/rfork/test_transfer_backend.py b/tests/ut/model_loader/rfork/test_transfer_backend.py
+new file mode 100644
+index 00000000..502b277a
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_transfer_backend.py
+@@ -0,0 +1,98 @@
++import torch
++from torch import nn
++
++from vllm_ascend.model_loader.rfork import transfer_backend as transfer_backend_module
++from vllm_ascend.model_loader.rfork.transfer_backend import (
++    RForkTransferBackend,
++    _iter_transferable_tensors,
++)
++
++
++class _RuntimeImpl:
++    def __init__(self):
++        self.W_UV = torch.ones(8)
++        self.W_UK_T = torch.ones(9)
++
++
++class _ModelWithRuntimeTensors(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(2, 3))
++        self.zero_weight = nn.Parameter(torch.empty(0))
++        self.register_buffer("buffer_weight", torch.ones(4))
++        self.runtime_weight = torch.ones(5)
++        self.runtime_weight_list = [torch.ones(6), torch.empty(0)]
++        self.runtime_weight_dict = {"expert": torch.ones(7)}
++        self.impl = _RuntimeImpl()
++        self.quant_method = _RuntimeImpl()
++
++
++class _FakeResult:
++    def is_error(self):
++        return False
++
++
++class _FakeTransferEngine:
++    def __init__(self):
++        self.transfer_args = None
++
++    def batch_transfer_sync_read(self, seed_session_id, client_ptr_list, seed_ptr_list, client_len_list):
++        self.transfer_args = (
++            seed_session_id,
++            client_ptr_list,
++            seed_ptr_list,
++            client_len_list,
++        )
++        return _FakeResult()
++
++
++def test_iter_transferable_tensors_includes_runtime_tensor_attrs():
++    names = {name for name, _ in _iter_transferable_tensors(_ModelWithRuntimeTensors())}
++
++    assert "weight" in names
++    assert "buffer_weight" in names
++    assert "runtime_weight" in names
++    assert "runtime_weight_list.0" in names
++    assert "runtime_weight_dict.expert" in names
++    assert "impl.W_UV" in names
++    assert "impl.W_UK_T" in names
++    assert "quant_method.W_UV" not in names
++    assert "quant_method.W_UK_T" not in names
++    assert "zero_weight" not in names
++    assert "runtime_weight_list.1" not in names
++
++
++def test_recv_from_source_uses_transferable_tensor_manifest(monkeypatch):
++    model = _ModelWithRuntimeTensors()
++    tensors = dict(_iter_transferable_tensors(model))
++    seed_weight_info = {
++        name: (index + 1, tensor.numel(), tensor.element_size())
++        for index, (name, tensor) in enumerate(tensors.items())
++    }
++
++    monkeypatch.setattr(
++        transfer_backend_module,
++        "get_remote_instance_transfer_engine_info",
++        lambda seed_url, local_seed_key: ("seed-session", seed_weight_info),
++    )
++
++    transfer_engine = _FakeTransferEngine()
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = transfer_engine
++
++    assert backend.recv_from_source(
++        model=model,
++        seed_instance_ip="127.0.0.1",
++        seed_instance_service_port=1234,
++        local_seed_key="seed-key",
++    )
++
++    assert transfer_engine.transfer_args is not None
++    seed_session_id, client_ptr_list, seed_ptr_list, client_len_list = transfer_engine.transfer_args
++    assert seed_session_id == "seed-session"
++    assert len(client_ptr_list) == len(seed_weight_info)
++    assert seed_ptr_list == [info[0] for info in seed_weight_info.values()]
++    assert client_len_list == [
++        tensor.numel() * tensor.element_size()
++        for tensor in tensors.values()
++    ]
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 8c94ca43..8bc8305b 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -113,6 +113,9 @@ class RForkModelLoader(BaseModelLoader):
+             rfork_worker = self.load_config.rfork_worker
+         return rfork_worker
+ 
++    def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
++        return getattr(model_config, "quantization", None) is not None
++
+     def load_model(
+         self,
+         vllm_config: VllmConfig,
+@@ -127,6 +130,7 @@ class RForkModelLoader(BaseModelLoader):
+         with set_default_torch_dtype(model_config.dtype):
+             need_del = False
+             rfork_worker = self._ensure_rfork_worker(vllm_config)
++            processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
+             try:
+                 if not rfork_worker.is_seed_available():
+                     raise RuntimeError("seed is not available.")
+@@ -139,6 +143,10 @@ class RForkModelLoader(BaseModelLoader):
+                     )
+                     need_del = True
+ 
++                if processed_layout_transfer:
++                    logger.info("RFork uses post-load tensor layout transfer for quantized model.")
++                    process_weights_after_loading(model, model_config, target_device)
++
+                 weight_load_start_time = time.time()
+                 if not rfork_worker.pre_transfer(model):
+                     raise RuntimeError("pre_transfer failed.")
+@@ -152,13 +160,15 @@ class RForkModelLoader(BaseModelLoader):
+                 )
+ 
+                 rfork_worker.start_seed_service(model)
+-                process_weights_after_loading(model, model_config, target_device)
++                if not processed_layout_transfer:
++                    process_weights_after_loading(model, model_config, target_device)
+ 
+                 return model.eval()
+             except Exception as e:
+                 logger.warning(f"RFork transfer failed: {e}, clean up and fall back to default loader")
+ 
+                 rfork_worker.post_transfer()
++                rfork_worker.reset_transfer_state()
+ 
+                 if need_del:
+                     del model
+@@ -179,6 +189,7 @@ class RForkModelLoader(BaseModelLoader):
+                     prefix=prefix,
+                 )
+                 try:
++                    rfork_worker.reset_transfer_state()
+                     rfork_worker.start_seed_service(model)
+                 except Exception as e:
+                     logger.warning(
+diff --git a/vllm_ascend/model_loader/rfork/rfork_worker.py b/vllm_ascend/model_loader/rfork/rfork_worker.py
+index b342f667..81605d68 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_worker.py
++++ b/vllm_ascend/model_loader/rfork/rfork_worker.py
+@@ -70,6 +70,13 @@ class RForkWorker:
+             logger.exception("Pre-transfer failed: %s", e)
+             return False
+ 
++    def reset_transfer_state(self) -> None:
++        try:
++            self.transfer_backend.unregister_memory_region()
++        except Exception as e:
++            logger.warning("Failed to unregister rfork memory region: %s", e)
++        self.ready_to_start_seed_service = False
++
+     def transfer(self, model) -> bool:
+         try:
+             assert self.transfer_backend.is_initialized(), "transfer_backend is not initialized, cannot transfer."
+@@ -89,6 +96,7 @@ class RForkWorker:
+             logger.info("rfork seed is None, no need to release.")
+             return True
+         self.seed_protocol.release_seed(self.rfork_seed)
++        self.rfork_seed = None
+         return True
+ 
+     def start_seed_service(self, model):
+diff --git a/vllm_ascend/model_loader/rfork/transfer_backend.py b/vllm_ascend/model_loader/rfork/transfer_backend.py
+index afb60b75..cfb95188 100644
+--- a/vllm_ascend/model_loader/rfork/transfer_backend.py
++++ b/vllm_ascend/model_loader/rfork/transfer_backend.py
+@@ -19,10 +19,76 @@ from typing import Any
+ 
+ import requests
+ import torch
++from torch import nn
+ from vllm.logger import logger
+ from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
+ 
+ 
++def _is_transferable_tensor(tensor: torch.Tensor) -> bool:
++    return not tensor.is_meta and tensor.numel() > 0
++
++
++def _iter_tensors_in_value(prefix: str, value: Any, visited_object_ids: set[int], scan_objects: bool = False):
++    if isinstance(value, torch.Tensor):
++        yield prefix, value
++        return
++
++    if isinstance(value, nn.Module) or isinstance(value, (str, bytes)) or callable(value):
++        return
++
++    if isinstance(value, (list, tuple)):
++        for index, item in enumerate(value):
++            yield from _iter_tensors_in_value(f"{prefix}.{index}", item, visited_object_ids, scan_objects)
++        return
++
++    if isinstance(value, dict):
++        for key, item in value.items():
++            yield from _iter_tensors_in_value(f"{prefix}.{key}", item, visited_object_ids, scan_objects)
++        return
++
++    if not scan_objects or not hasattr(value, "__dict__"):
++        return
++
++    value_id = id(value)
++    if value_id in visited_object_ids:
++        return
++    visited_object_ids.add(value_id)
++    for attr_name, attr_value in vars(value).items():
++        if attr_name.startswith("_"):
++            continue
++        yield from _iter_tensors_in_value(f"{prefix}.{attr_name}", attr_value, visited_object_ids, scan_objects)
++
++
++def _iter_transferable_tensors(model: nn.Module):
++    seen_tensor_ids: set[int] = set()
++
++    for name, tensor in model.named_parameters():
++        if _is_transferable_tensor(tensor):
++            seen_tensor_ids.add(id(tensor))
++            yield name, tensor
++
++    for name, tensor in model.named_buffers():
++        if id(tensor) not in seen_tensor_ids and _is_transferable_tensor(tensor):
++            seen_tensor_ids.add(id(tensor))
++            yield name, tensor
++
++    # Some Ascend post-load paths replace checkpoint parameters with runtime
++    # tensors stored as plain module attributes, e.g. MLA/SFA W_UV and W_UK_T.
++    for module_prefix, module in model.named_modules():
++        for attr_name, attr_value in vars(module).items():
++            if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
++                continue
++
++            scan_objects = attr_name == "impl"
++            for tensor_name, tensor in _iter_tensors_in_value(attr_name, attr_value, set(), scan_objects):
++                if id(tensor) in seen_tensor_ids or not _is_transferable_tensor(tensor):
++                    continue
++
++                seen_tensor_ids.add(id(tensor))
++                full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
++                yield full_name, tensor
++
++
+ class RForkTransferBackend:
+     def __init__(self):
+         self.rfork_transfer_engine: Any | None = None
+@@ -66,7 +132,7 @@ class RForkTransferBackend:
+ 
+         weight_mr_dict = {}
+         weight_addr_set = set()
+-        for name, weight in model.named_parameters():
++        for name, weight in _iter_transferable_tensors(model):
+             weight_mr_dict[name] = (
+                 weight.data_ptr(),
+                 weight.numel(),
+@@ -112,14 +178,20 @@ class RForkTransferBackend:
+         self.registered_weight_blocks = weight_blocks_for_reg_mr
+ 
+         logger.info(
+-            "register_memory_region time: %.4fs",
++            "register_memory_region time: %.4fs, weights: %d",
+             time.time() - start_reg_mr_tic,
++            len(weight_mr_dict),
+         )
+         return True
+ 
+     def unregister_memory_region(self) -> bool:
+         transfer_engine = self._get_transfer_engine()
+         start_unreg_mr_tic = time.time()
++        if not self.registered_weight_blocks:
++            self.rfork_transfer_engine_weights_info_dict = None
++            logger.info("unregister_memory_region skipped because no blocks are registered.")
++            return True
++
+         ret = transfer_engine.batch_unregister_memory([address for address, _ in self.registered_weight_blocks])
+         if ret.is_error():
+             logger.error(
+@@ -153,7 +225,7 @@ class RForkTransferBackend:
+         seed_ptr_list = []
+         client_ptr_list = []
+         client_len_list = []
+-        for name, tensor in model.named_parameters():
++        for name, tensor in _iter_transferable_tensors(model):
+             weight_info = seed_weight_info.get(name, None)
+             if weight_info is None:
+                 logger.error("Cannot find weight info for %s.", name)
+-- 
+2.51.0.windows.1
+
