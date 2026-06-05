@@ -70,6 +70,13 @@ class RForkWorker:
             logger.exception("Pre-transfer failed: %s", e)
             return False
 
+    def reset_transfer_state(self) -> None:
+        try:
+            self.transfer_backend.unregister_memory_region()
+        except Exception as e:
+            logger.warning("Failed to unregister rfork memory region: %s", e)
+        self.ready_to_start_seed_service = False
+
     def transfer(self, model) -> bool:
         try:
             assert self.transfer_backend.is_initialized(), "transfer_backend is not initialized, cannot transfer."
@@ -89,6 +96,7 @@ class RForkWorker:
             logger.info("rfork seed is None, no need to release.")
             return True
         self.seed_protocol.release_seed(self.rfork_seed)
+        self.rfork_seed = None
         return True
 
     def start_seed_service(self, model):

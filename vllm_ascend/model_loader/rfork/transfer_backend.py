@@ -19,8 +19,74 @@ from typing import Any
 
 import requests
 import torch
+from torch import nn
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
+
+
+def _is_transferable_tensor(tensor: torch.Tensor) -> bool:
+    return not tensor.is_meta and tensor.numel() > 0
+
+
+def _iter_tensors_in_value(prefix: str, value: Any, visited_object_ids: set[int], scan_objects: bool = False):
+    if isinstance(value, torch.Tensor):
+        yield prefix, value
+        return
+
+    if isinstance(value, nn.Module) or isinstance(value, (str, bytes)) or callable(value):
+        return
+
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield from _iter_tensors_in_value(f"{prefix}.{index}", item, visited_object_ids, scan_objects)
+        return
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _iter_tensors_in_value(f"{prefix}.{key}", item, visited_object_ids, scan_objects)
+        return
+
+    if not scan_objects or not hasattr(value, "__dict__"):
+        return
+
+    value_id = id(value)
+    if value_id in visited_object_ids:
+        return
+    visited_object_ids.add(value_id)
+    for attr_name, attr_value in vars(value).items():
+        if attr_name.startswith("_"):
+            continue
+        yield from _iter_tensors_in_value(f"{prefix}.{attr_name}", attr_value, visited_object_ids, scan_objects)
+
+
+def _iter_transferable_tensors(model: nn.Module):
+    seen_tensor_ids: set[int] = set()
+
+    for name, tensor in model.named_parameters():
+        if _is_transferable_tensor(tensor):
+            seen_tensor_ids.add(id(tensor))
+            yield name, tensor
+
+    for name, tensor in model.named_buffers():
+        if id(tensor) not in seen_tensor_ids and _is_transferable_tensor(tensor):
+            seen_tensor_ids.add(id(tensor))
+            yield name, tensor
+
+    # Some Ascend post-load paths replace checkpoint parameters with runtime
+    # tensors stored as plain module attributes, e.g. MLA/SFA W_UV and W_UK_T.
+    for module_prefix, module in model.named_modules():
+        for attr_name, attr_value in vars(module).items():
+            if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
+                continue
+
+            scan_objects = attr_name == "impl"
+            for tensor_name, tensor in _iter_tensors_in_value(attr_name, attr_value, set(), scan_objects):
+                if id(tensor) in seen_tensor_ids or not _is_transferable_tensor(tensor):
+                    continue
+
+                seen_tensor_ids.add(id(tensor))
+                full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
+                yield full_name, tensor
 
 
 class RForkTransferBackend:
@@ -66,7 +132,7 @@ class RForkTransferBackend:
 
         weight_mr_dict = {}
         weight_addr_set = set()
-        for name, weight in model.named_parameters():
+        for name, weight in _iter_transferable_tensors(model):
             weight_mr_dict[name] = (
                 weight.data_ptr(),
                 weight.numel(),
@@ -112,14 +178,20 @@ class RForkTransferBackend:
         self.registered_weight_blocks = weight_blocks_for_reg_mr
 
         logger.info(
-            "register_memory_region time: %.4fs",
+            "register_memory_region time: %.4fs, weights: %d",
             time.time() - start_reg_mr_tic,
+            len(weight_mr_dict),
         )
         return True
 
     def unregister_memory_region(self) -> bool:
         transfer_engine = self._get_transfer_engine()
         start_unreg_mr_tic = time.time()
+        if not self.registered_weight_blocks:
+            self.rfork_transfer_engine_weights_info_dict = None
+            logger.info("unregister_memory_region skipped because no blocks are registered.")
+            return True
+
         ret = transfer_engine.batch_unregister_memory([address for address, _ in self.registered_weight_blocks])
         if ret.is_error():
             logger.error(
@@ -153,7 +225,7 @@ class RForkTransferBackend:
         seed_ptr_list = []
         client_ptr_list = []
         client_len_list = []
-        for name, tensor in model.named_parameters():
+        for name, tensor in _iter_transferable_tensors(model):
             weight_info = seed_weight_info.get(name, None)
             if weight_info is None:
                 logger.error("Cannot find weight info for %s.", name)
