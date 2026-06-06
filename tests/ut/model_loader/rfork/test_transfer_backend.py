@@ -4,8 +4,10 @@ from torch import nn
 
 from vllm_ascend.model_loader.rfork import transfer_backend as transfer_backend_module
 from vllm_ascend.model_loader.rfork.transfer_backend import (
+    MAX_TRANSFER_CHUNK_BYTES,
     RForkTransferBackend,
     _block_contains_weight_ptr,
+    _iter_transfer_chunks,
     _iter_transferable_tensors,
 )
 
@@ -34,6 +36,7 @@ class _ModelWithRuntimeTensors(nn.Module):
         self.runtime_weight = torch.ones(5)
         self.runtime_weight_list = [torch.ones(6), torch.empty(0)]
         self.runtime_weight_dict = {"expert": torch.ones(7)}
+        self.runtime_alias = self.weight.data
         self.impl = _RuntimeImpl()
         self.quant_method = _RuntimeImpl()
 
@@ -69,6 +72,7 @@ def test_iter_transferable_tensors_includes_runtime_tensor_attrs():
     assert "impl.W_UK_T" in names
     assert "quant_method.W_UV" not in names
     assert "quant_method.W_UK_T" not in names
+    assert "runtime_alias" not in names
     assert "zero_weight" not in names
     assert "runtime_weight_list.1" not in names
 
@@ -80,6 +84,17 @@ def test_block_contains_weight_ptr_matches_ptr_inside_block():
     assert _block_contains_weight_ptr(200, 100, sorted_weight_ptrs)
     assert not _block_contains_weight_ptr(101, 149, sorted_weight_ptrs)
     assert not _block_contains_weight_ptr(450, 50, sorted_weight_ptrs)
+
+
+def test_iter_transfer_chunks_splits_by_size_and_weight_count():
+    names = ["a", "b", "c"]
+    seed_ptrs = [1, 2, 3]
+    client_ptrs = [4, 5, 6]
+    lengths = [MAX_TRANSFER_CHUNK_BYTES, 1, 1]
+
+    chunks = list(_iter_transfer_chunks(names, seed_ptrs, client_ptrs, lengths))
+
+    assert [chunk[0] for chunk in chunks] == [["a"], ["b", "c"]]
 
 
 def test_recv_from_source_uses_transferable_tensor_manifest(monkeypatch):

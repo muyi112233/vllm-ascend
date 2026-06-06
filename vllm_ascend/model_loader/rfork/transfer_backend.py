@@ -24,6 +24,9 @@ from torch import nn
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
 
+MAX_TRANSFER_CHUNK_BYTES = 1024**3
+MAX_TRANSFER_CHUNK_WEIGHTS = 512
+
 
 def _is_transferable_tensor(tensor: torch.Tensor) -> bool:
     return (
@@ -69,16 +72,16 @@ def _iter_tensors_in_value(prefix: str, value: Any, visited_object_ids: set[int]
 
 
 def _iter_transferable_tensors(model: nn.Module):
-    seen_tensor_ids: set[int] = set()
+    seen_data_ptrs: set[int] = set()
 
     for name, tensor in model.named_parameters():
-        if _is_transferable_tensor(tensor):
-            seen_tensor_ids.add(id(tensor))
+        if _is_transferable_tensor(tensor) and tensor.data_ptr() not in seen_data_ptrs:
+            seen_data_ptrs.add(tensor.data_ptr())
             yield name, tensor
 
     for name, tensor in model.named_buffers():
-        if id(tensor) not in seen_tensor_ids and _is_transferable_tensor(tensor):
-            seen_tensor_ids.add(id(tensor))
+        if _is_transferable_tensor(tensor) and tensor.data_ptr() not in seen_data_ptrs:
+            seen_data_ptrs.add(tensor.data_ptr())
             yield name, tensor
 
     # Some Ascend post-load paths replace checkpoint parameters with runtime
@@ -90,10 +93,10 @@ def _iter_transferable_tensors(model: nn.Module):
 
             scan_objects = attr_name == "impl"
             for tensor_name, tensor in _iter_tensors_in_value(attr_name, attr_value, set(), scan_objects):
-                if id(tensor) in seen_tensor_ids or not _is_transferable_tensor(tensor):
+                if not _is_transferable_tensor(tensor) or tensor.data_ptr() in seen_data_ptrs:
                     continue
 
-                seen_tensor_ids.add(id(tensor))
+                seen_data_ptrs.add(tensor.data_ptr())
                 full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
                 yield full_name, tensor
 
@@ -101,6 +104,47 @@ def _iter_transferable_tensors(model: nn.Module):
 def _block_contains_weight_ptr(address: int, size: int, sorted_weight_ptrs: list[int]) -> bool:
     index = bisect_left(sorted_weight_ptrs, address)
     return index < len(sorted_weight_ptrs) and sorted_weight_ptrs[index] < address + size
+
+
+def _iter_transfer_chunks(
+    weight_names: list[str],
+    seed_ptr_list: list[int],
+    client_ptr_list: list[int],
+    client_len_list: list[int],
+):
+    chunk_start = 0
+    chunk_bytes = 0
+    chunk_weights = 0
+
+    for index, length in enumerate(client_len_list):
+        should_flush = (
+            chunk_weights > 0
+            and (
+                chunk_bytes + length > MAX_TRANSFER_CHUNK_BYTES
+                or chunk_weights >= MAX_TRANSFER_CHUNK_WEIGHTS
+            )
+        )
+        if should_flush:
+            yield (
+                weight_names[chunk_start:index],
+                seed_ptr_list[chunk_start:index],
+                client_ptr_list[chunk_start:index],
+                client_len_list[chunk_start:index],
+            )
+            chunk_start = index
+            chunk_bytes = 0
+            chunk_weights = 0
+
+        chunk_bytes += length
+        chunk_weights += 1
+
+    if chunk_weights > 0:
+        yield (
+            weight_names[chunk_start:],
+            seed_ptr_list[chunk_start:],
+            client_ptr_list[chunk_start:],
+            client_len_list[chunk_start:],
+        )
 
 
 class RForkTransferBackend:
@@ -240,6 +284,7 @@ class RForkTransferBackend:
         seed_ptr_list = []
         client_ptr_list = []
         client_len_list = []
+        weight_names = []
         for name, tensor in _iter_transferable_tensors(model):
             weight_info = seed_weight_info.get(name, None)
             if weight_info is None:
@@ -261,6 +306,7 @@ class RForkTransferBackend:
             seed_ptr_list.append(seed_ptr)
             client_ptr_list.append(tensor.data_ptr())
             client_len_list.append(tensor.numel() * tensor.element_size())
+            weight_names.append(name)
 
         start_transfer_tic = time.time()
         logger.info(
@@ -268,15 +314,40 @@ class RForkTransferBackend:
             len(client_len_list),
             sum(client_len_list) / (1024**3),
         )
-        ret = transfer_engine.batch_transfer_sync_read(
-            seed_session_id,
-            client_ptr_list,
-            seed_ptr_list,
-            client_len_list,
+        transfer_chunks = list(
+            _iter_transfer_chunks(
+                weight_names,
+                seed_ptr_list,
+                client_ptr_list,
+                client_len_list,
+            )
         )
-        if ret.is_error():
-            logger.error("Failed to transfer weights from remote instance, ret=%s", ret.to_string())
-            return False
+        for index, (chunk_names, chunk_seed_ptrs, chunk_client_ptrs, chunk_lengths) in enumerate(transfer_chunks, 1):
+            chunk_start_tic = time.time()
+            logger.info(
+                "transfer weights chunk %d/%d starts, weights: %d, bytes: %.2f GiB, first: %s, last: %s",
+                index,
+                len(transfer_chunks),
+                len(chunk_lengths),
+                sum(chunk_lengths) / (1024**3),
+                chunk_names[0],
+                chunk_names[-1],
+            )
+            ret = transfer_engine.batch_transfer_sync_read(
+                seed_session_id,
+                chunk_client_ptrs,
+                chunk_seed_ptrs,
+                chunk_lengths,
+            )
+            if ret.is_error():
+                logger.error("Failed to transfer weights from remote instance, ret=%s", ret.to_string())
+                return False
+            logger.info(
+                "transfer weights chunk %d/%d done, time: %.4fs",
+                index,
+                len(transfer_chunks),
+                time.time() - chunk_start_tic,
+            )
 
         logger.info("transfer weights time: %.4fs", time.time() - start_transfer_tic)
         return True
