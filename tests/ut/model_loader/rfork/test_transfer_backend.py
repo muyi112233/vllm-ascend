@@ -1,11 +1,22 @@
 import torch
+import pytest
 from torch import nn
 
 from vllm_ascend.model_loader.rfork import transfer_backend as transfer_backend_module
 from vllm_ascend.model_loader.rfork.transfer_backend import (
     RForkTransferBackend,
+    _block_contains_weight_ptr,
     _iter_transferable_tensors,
 )
+
+
+@pytest.fixture(autouse=True)
+def allow_cpu_tensors_for_manifest_tests(monkeypatch):
+    monkeypatch.setattr(
+        transfer_backend_module,
+        "_is_tensor_on_transfer_device",
+        lambda tensor: True,
+    )
 
 
 class _RuntimeImpl:
@@ -60,6 +71,15 @@ def test_iter_transferable_tensors_includes_runtime_tensor_attrs():
     assert "quant_method.W_UK_T" not in names
     assert "zero_weight" not in names
     assert "runtime_weight_list.1" not in names
+
+
+def test_block_contains_weight_ptr_matches_ptr_inside_block():
+    sorted_weight_ptrs = [100, 250, 400]
+
+    assert _block_contains_weight_ptr(80, 30, sorted_weight_ptrs)
+    assert _block_contains_weight_ptr(200, 100, sorted_weight_ptrs)
+    assert not _block_contains_weight_ptr(101, 149, sorted_weight_ptrs)
+    assert not _block_contains_weight_ptr(450, 50, sorted_weight_ptrs)
 
 
 def test_recv_from_source_uses_transferable_tensor_manifest(monkeypatch):
