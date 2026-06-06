@@ -1,0 +1,128 @@
+From 069e19579a235f69a3dc9327aaf1238f455d854c Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Sat, 6 Jun 2026 15:02:34 +0800
+Subject: [PATCH] transferbug
+
+---
+ .../rfork/test_transfer_backend.py            | 20 ++++++++++++++++
+ .../model_loader/rfork/transfer_backend.py    | 24 +++++++++++++++++--
+ 2 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/tests/ut/model_loader/rfork/test_transfer_backend.py b/tests/ut/model_loader/rfork/test_transfer_backend.py
+index 502b277a..0ded55f7 100644
+--- a/tests/ut/model_loader/rfork/test_transfer_backend.py
++++ b/tests/ut/model_loader/rfork/test_transfer_backend.py
+@@ -1,13 +1,24 @@
+ import torch
++import pytest
+ from torch import nn
+ 
+ from vllm_ascend.model_loader.rfork import transfer_backend as transfer_backend_module
+ from vllm_ascend.model_loader.rfork.transfer_backend import (
+     RForkTransferBackend,
++    _block_contains_weight_ptr,
+     _iter_transferable_tensors,
+ )
+ 
+ 
++@pytest.fixture(autouse=True)
++def allow_cpu_tensors_for_manifest_tests(monkeypatch):
++    monkeypatch.setattr(
++        transfer_backend_module,
++        "_is_tensor_on_transfer_device",
++        lambda tensor: True,
++    )
++
++
+ class _RuntimeImpl:
+     def __init__(self):
+         self.W_UV = torch.ones(8)
+@@ -62,6 +73,15 @@ def test_iter_transferable_tensors_includes_runtime_tensor_attrs():
+     assert "runtime_weight_list.1" not in names
+ 
+ 
++def test_block_contains_weight_ptr_matches_ptr_inside_block():
++    sorted_weight_ptrs = [100, 250, 400]
++
++    assert _block_contains_weight_ptr(80, 30, sorted_weight_ptrs)
++    assert _block_contains_weight_ptr(200, 100, sorted_weight_ptrs)
++    assert not _block_contains_weight_ptr(101, 149, sorted_weight_ptrs)
++    assert not _block_contains_weight_ptr(450, 50, sorted_weight_ptrs)
++
++
+ def test_recv_from_source_uses_transferable_tensor_manifest(monkeypatch):
+     model = _ModelWithRuntimeTensors()
+     tensors = dict(_iter_transferable_tensors(model))
+diff --git a/vllm_ascend/model_loader/rfork/transfer_backend.py b/vllm_ascend/model_loader/rfork/transfer_backend.py
+index cfb95188..14bbfabd 100644
+--- a/vllm_ascend/model_loader/rfork/transfer_backend.py
++++ b/vllm_ascend/model_loader/rfork/transfer_backend.py
+@@ -15,6 +15,7 @@
+ #
+ 
+ import time
++from bisect import bisect_left
+ from typing import Any
+ 
+ import requests
+@@ -25,7 +26,15 @@ from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
+ 
+ 
+ def _is_transferable_tensor(tensor: torch.Tensor) -> bool:
+-    return not tensor.is_meta and tensor.numel() > 0
++    return (
++        not tensor.is_meta
++        and tensor.numel() > 0
++        and _is_tensor_on_transfer_device(tensor)
++    )
++
++
++def _is_tensor_on_transfer_device(tensor: torch.Tensor) -> bool:
++    return tensor.device.type == "npu"
+ 
+ 
+ def _iter_tensors_in_value(prefix: str, value: Any, visited_object_ids: set[int], scan_objects: bool = False):
+@@ -89,6 +98,11 @@ def _iter_transferable_tensors(model: nn.Module):
+                 yield full_name, tensor
+ 
+ 
++def _block_contains_weight_ptr(address: int, size: int, sorted_weight_ptrs: list[int]) -> bool:
++    index = bisect_left(sorted_weight_ptrs, address)
++    return index < len(sorted_weight_ptrs) and sorted_weight_ptrs[index] < address + size
++
++
+ class RForkTransferBackend:
+     def __init__(self):
+         self.rfork_transfer_engine: Any | None = None
+@@ -139,6 +153,7 @@ class RForkTransferBackend:
+                 weight.element_size(),
+             )
+             weight_addr_set.add(weight.data_ptr())
++        sorted_weight_ptrs = sorted(weight_addr_set)
+ 
+         memory_snapshot = torch.npu.memory.memory_snapshot()
+         weight_blocks_for_reg_mr = []
+@@ -150,7 +165,7 @@ class RForkTransferBackend:
+                 state = block.get("state", "")
+                 if address < 0 or size < 0 or state == "":
+                     continue
+-                if state == "active_allocated" and address in weight_addr_set:
++                if state == "active_allocated" and _block_contains_weight_ptr(address, size, sorted_weight_ptrs):
+                     if current_weight_block is None:
+                         current_weight_block = (address, size)
+                     elif current_weight_block[0] + current_weight_block[1] == address:
+@@ -248,6 +263,11 @@ class RForkTransferBackend:
+             client_len_list.append(tensor.numel() * tensor.element_size())
+ 
+         start_transfer_tic = time.time()
++        logger.info(
++            "transfer weights starts, weights: %d, total bytes: %.2f GiB",
++            len(client_len_list),
++            sum(client_len_list) / (1024**3),
++        )
+         ret = transfer_engine.batch_transfer_sync_read(
+             seed_session_id,
+             client_ptr_list,
+-- 
+2.51.0.windows.1
+
