@@ -1,0 +1,136 @@
+From c75d9d2a75e46350e11225c5dfc2df97b1e5ff98 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Tue, 9 Jun 2026 11:34:56 +0800
+Subject: [PATCH] Qwen
+
+---
+ .../model_loader/rfork/transfer_backend.py    | 65 +++++++++++++++----
+ 1 file changed, 53 insertions(+), 12 deletions(-)
+
+diff --git a/vllm_ascend/model_loader/rfork/transfer_backend.py b/vllm_ascend/model_loader/rfork/transfer_backend.py
+index e019a6ce..65d2dcef 100644
+--- a/vllm_ascend/model_loader/rfork/transfer_backend.py
++++ b/vllm_ascend/model_loader/rfork/transfer_backend.py
+@@ -36,6 +36,22 @@ def _is_tensor_on_transfer_device(tensor: torch.Tensor) -> bool:
+     return tensor.device.type == "npu"
+ 
+ 
++def _get_tensor_transfer_region(tensor: torch.Tensor) -> tuple[int, int]:
++    data_ptr = tensor.data_ptr()
++    logical_nbytes = tensor.numel() * tensor.element_size()
++    try:
++        storage = tensor.untyped_storage()
++        storage_ptr = storage.data_ptr()
++        storage_nbytes = storage.nbytes()
++        storage_offset = tensor.storage_offset()
++    except Exception:
++        return data_ptr, logical_nbytes
++
++    if storage_ptr > 0 and storage_offset == 0:
++        return storage_ptr, max(logical_nbytes, storage_nbytes)
++    return data_ptr, logical_nbytes
++
++
+ def _iter_tensors_in_value(prefix: str, value: Any, visited_object_ids: set[int], scan_objects: bool = False):
+     if isinstance(value, torch.Tensor):
+         yield prefix, value
+@@ -68,16 +84,23 @@ def _iter_tensors_in_value(prefix: str, value: Any, visited_object_ids: set[int]
+ 
+ 
+ def _iter_transferable_tensors(model: nn.Module):
+-    seen_data_ptrs: set[int] = set()
++    seen_regions: set[tuple[int, int]] = set()
++
++    def should_yield(tensor: torch.Tensor) -> bool:
++        if not _is_transferable_tensor(tensor):
++            return False
++        transfer_region = _get_tensor_transfer_region(tensor)
++        if transfer_region in seen_regions:
++            return False
++        seen_regions.add(transfer_region)
++        return True
+ 
+     for name, tensor in model.named_parameters():
+-        if _is_transferable_tensor(tensor) and tensor.data_ptr() not in seen_data_ptrs:
+-            seen_data_ptrs.add(tensor.data_ptr())
++        if should_yield(tensor):
+             yield name, tensor
+ 
+     for name, tensor in model.named_buffers():
+-        if _is_transferable_tensor(tensor) and tensor.data_ptr() not in seen_data_ptrs:
+-            seen_data_ptrs.add(tensor.data_ptr())
++        if should_yield(tensor):
+             yield name, tensor
+ 
+     # Some Ascend post-load paths replace checkpoint parameters with runtime
+@@ -89,10 +112,9 @@ def _iter_transferable_tensors(model: nn.Module):
+ 
+             scan_objects = attr_name == "impl"
+             for tensor_name, tensor in _iter_tensors_in_value(attr_name, attr_value, set(), scan_objects):
+-                if not _is_transferable_tensor(tensor) or tensor.data_ptr() in seen_data_ptrs:
++                if not should_yield(tensor):
+                     continue
+ 
+-                seen_data_ptrs.add(tensor.data_ptr())
+                 full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
+                 yield full_name, tensor
+ 
+@@ -190,12 +212,14 @@ class RForkTransferBackend:
+         weight_mr_dict = {}
+         weight_addr_set = set()
+         for name, weight in _iter_transferable_tensors(model):
++            transfer_ptr, transfer_nbytes = _get_tensor_transfer_region(weight)
+             weight_mr_dict[name] = (
+-                weight.data_ptr(),
++                transfer_ptr,
+                 weight.numel(),
+                 weight.element_size(),
++                transfer_nbytes,
+             )
+-            weight_addr_set.add(weight.data_ptr())
++            weight_addr_set.add(transfer_ptr)
+         sorted_weight_ptrs = sorted(weight_addr_set)
+ 
+         memory_snapshot = torch.npu.memory.memory_snapshot()
+@@ -290,7 +314,16 @@ class RForkTransferBackend:
+                 logger.error("Cannot find weight info for %s.", name)
+                 return False
+ 
+-            seed_ptr, seed_len, seed_size = weight_info
++            if len(weight_info) == 3:
++                seed_ptr, seed_len, seed_size = weight_info
++                seed_nbytes = seed_len * seed_size
++            elif len(weight_info) == 4:
++                seed_ptr, seed_len, seed_size, seed_nbytes = weight_info
++            else:
++                logger.error("Invalid weight info for %s: %s", name, weight_info)
++                return False
++
++            tensor_ptr, tensor_nbytes = _get_tensor_transfer_region(tensor)
+             if seed_len != tensor.numel() or seed_size != tensor.element_size():
+                 logger.error(
+                     "Weight info mismatch for %s, expected (%s, %s), got (%s, %s)",
+@@ -301,10 +334,18 @@ class RForkTransferBackend:
+                     tensor.element_size(),
+                 )
+                 return False
++            if seed_nbytes != tensor_nbytes:
++                logger.error(
++                    "Weight storage size mismatch for %s, expected %s bytes, got %s bytes",
++                    name,
++                    seed_nbytes,
++                    tensor_nbytes,
++                )
++                return False
+ 
+             seed_ptr_list.append(seed_ptr)
+-            client_ptr_list.append(tensor.data_ptr())
+-            client_len_list.append(tensor.numel() * tensor.element_size())
++            client_ptr_list.append(tensor_ptr)
++            client_len_list.append(tensor_nbytes)
+             weight_names.append(name)
+ 
+         start_transfer_tic = time.time()
+-- 
+2.51.0.windows.1
+
