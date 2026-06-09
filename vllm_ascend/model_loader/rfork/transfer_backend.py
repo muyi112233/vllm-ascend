@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 
+import hashlib
 import time
 from bisect import bisect_left
 from typing import Any
@@ -26,6 +27,8 @@ from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
 
 MAX_TRANSFER_CHUNK_BYTES = 1024**3
 MAX_TRANSFER_CHUNK_WEIGHTS = 512
+MAX_DEBUG_TENSOR_SAMPLE_ELEMENTS = 4096
+MAX_DEBUG_TENSOR_VERIFY_COUNT = 32
 
 
 def _is_transferable_tensor(tensor: torch.Tensor) -> bool:
@@ -119,6 +122,95 @@ def _iter_transferable_tensors(model: nn.Module):
                 yield full_name, tensor
 
 
+def _normalize_debug_patterns(patterns: list[str] | str | None) -> list[str]:
+    if patterns is None:
+        return []
+    if isinstance(patterns, str):
+        return [pattern.strip() for pattern in patterns.split(",") if pattern.strip()]
+    return [pattern.strip() for pattern in patterns if isinstance(pattern, str) and pattern.strip()]
+
+
+def _matches_any_pattern(name: str, patterns: list[str]) -> bool:
+    return not patterns or any(pattern in name for pattern in patterns)
+
+
+def _tensor_debug_info(name: str, tensor: torch.Tensor) -> dict[str, Any]:
+    transfer_ptr, transfer_nbytes = _get_tensor_transfer_region(tensor)
+    info: dict[str, Any] = {
+        "name": name,
+        "dtype": str(tensor.dtype),
+        "shape": list(tensor.shape),
+        "stride": list(tensor.stride()),
+        "numel": tensor.numel(),
+        "element_size": tensor.element_size(),
+        "data_ptr": tensor.data_ptr(),
+        "transfer_ptr": transfer_ptr,
+        "transfer_nbytes": transfer_nbytes,
+        "storage_offset": tensor.storage_offset(),
+        "is_contiguous": tensor.is_contiguous(),
+    }
+    try:
+        info["storage_nbytes"] = tensor.untyped_storage().nbytes()
+    except Exception:
+        info["storage_nbytes"] = None
+
+    try:
+        if tensor.is_contiguous() or tensor.numel() <= MAX_DEBUG_TENSOR_SAMPLE_ELEMENTS:
+            flat_tensor = tensor.detach().view(-1) if tensor.is_contiguous() else tensor.detach().reshape(-1)
+            sample_count = min(flat_tensor.numel(), MAX_DEBUG_TENSOR_SAMPLE_ELEMENTS)
+            if sample_count > 0:
+                if flat_tensor.numel() <= sample_count:
+                    sample = flat_tensor
+                elif sample_count == 1:
+                    sample = flat_tensor[:1]
+                else:
+                    indices = torch.arange(sample_count, dtype=torch.int64, device=flat_tensor.device)
+                    indices = indices * (flat_tensor.numel() - 1) // (sample_count - 1)
+                    sample = flat_tensor.index_select(0, indices)
+                sample_cpu = sample.detach().cpu().contiguous()
+                info["sample_count"] = sample_count
+                info["sample_digest"] = hashlib.sha256(sample_cpu.view(torch.uint8).numpy().tobytes()).hexdigest()
+            else:
+                info["sample_count"] = 0
+                info["sample_digest"] = None
+        else:
+            info["sample_count"] = 0
+            info["sample_digest"] = None
+            info["sample_digest_skipped"] = "non-contiguous large tensor"
+    except Exception as e:
+        info["sample_count"] = 0
+        info["sample_digest"] = None
+        info["sample_digest_error"] = str(e)
+    return info
+
+
+def collect_tensor_debug_info(
+    model: nn.Module,
+    patterns: list[str] | str | None = None,
+    limit: int = MAX_DEBUG_TENSOR_VERIFY_COUNT,
+) -> dict[str, Any]:
+    normalized_patterns = _normalize_debug_patterns(patterns)
+    limit = max(0, min(limit, MAX_DEBUG_TENSOR_VERIFY_COUNT))
+    selected_tensors = []
+    matched_count = 0
+    for name, tensor in _iter_transferable_tensors(model):
+        if not _matches_any_pattern(name, normalized_patterns):
+            continue
+        matched_count += 1
+        if len(selected_tensors) < limit:
+            selected_tensors.append((name, tensor))
+
+    torch.npu.synchronize()
+    tensors = {name: _tensor_debug_info(name, tensor) for name, tensor in selected_tensors}
+    torch.npu.synchronize()
+    return {
+        "patterns": normalized_patterns,
+        "matched_count": matched_count,
+        "returned_count": len(tensors),
+        "tensors": tensors,
+    }
+
+
 def _block_contains_weight_ptr(address: int, size: int, sorted_weight_ptrs: list[int]) -> bool:
     index = bisect_left(sorted_weight_ptrs, address)
     return index < len(sorted_weight_ptrs) and sorted_weight_ptrs[index] < address + size
@@ -209,6 +301,7 @@ class RForkTransferBackend:
         transfer_engine = self._get_transfer_engine()
         start_reg_mr_tic = time.time()
 
+        torch.npu.synchronize()
         weight_mr_dict = {}
         weight_addr_set = set()
         for name, weight in _iter_transferable_tensors(model):
@@ -296,6 +389,7 @@ class RForkTransferBackend:
         seed_instance_ip,
         seed_instance_service_port,
         local_seed_key,
+        debug_verify_patterns: list[str] | str | None = None,
     ):
         transfer_engine = self._get_transfer_engine()
         seed_url = f"http://{seed_instance_ip}:{seed_instance_service_port}"
@@ -397,6 +491,15 @@ class RForkTransferBackend:
                 time.time() - chunk_start_tic,
             )
 
+        torch.npu.synchronize()
+        if _normalize_debug_patterns(debug_verify_patterns):
+            if not verify_remote_tensor_debug_info(
+                model,
+                seed_url,
+                local_seed_key,
+                debug_verify_patterns,
+            ):
+                return False
         logger.info("transfer weights time: %.4fs", time.time() - start_transfer_tic)
         return True
 
@@ -428,3 +531,92 @@ def get_remote_instance_transfer_engine_info(seed_url: str, local_seed_key: str)
     except Exception as e:
         logger.error("Exception getting transfer engine info from %s: %s", seed_url, e)
         return None, None
+
+
+def get_remote_tensor_debug_info(
+    seed_url: str,
+    local_seed_key: str,
+    patterns: list[str] | str,
+    limit: int = MAX_DEBUG_TENSOR_VERIFY_COUNT,
+):
+    try:
+        response = requests.get(
+            f"{seed_url}/debug/rfork_tensor_info",
+            params={
+                "seed_key": local_seed_key,
+                "patterns": ",".join(_normalize_debug_patterns(patterns)),
+                "limit": limit,
+            },
+            timeout=30,
+        )
+        if response.status_code != 200:
+            logger.error(
+                "GET %s/debug/rfork_tensor_info failed: %s",
+                seed_url,
+                response.status_code,
+            )
+            return None
+
+        data = response.json()
+        return data.get("rfork_tensor_info", None)
+    except Exception as e:
+        logger.error("Exception getting tensor debug info from %s: %s", seed_url, e)
+        return None
+
+
+def verify_remote_tensor_debug_info(
+    model: nn.Module,
+    seed_url: str,
+    local_seed_key: str,
+    patterns: list[str] | str,
+) -> bool:
+    remote_info = get_remote_tensor_debug_info(seed_url, local_seed_key, patterns)
+    if remote_info is None:
+        logger.error("RFork tensor debug verify failed: cannot fetch seed tensor info.")
+        return False
+
+    local_info = collect_tensor_debug_info(model, patterns)
+    remote_tensors = remote_info.get("tensors", {})
+    local_tensors = local_info.get("tensors", {})
+    mismatch_details = []
+
+    for name, local_tensor_info in local_tensors.items():
+        remote_tensor_info = remote_tensors.get(name)
+        if remote_tensor_info is None:
+            mismatch_details.append(f"{name}: missing on seed")
+            continue
+
+        for field in ("dtype", "shape", "numel", "element_size", "transfer_nbytes"):
+            if local_tensor_info.get(field) != remote_tensor_info.get(field):
+                mismatch_details.append(
+                    f"{name}: {field} local={local_tensor_info.get(field)} seed={remote_tensor_info.get(field)}"
+                )
+
+        local_digest = local_tensor_info.get("sample_digest")
+        remote_digest = remote_tensor_info.get("sample_digest")
+        if local_digest is not None and remote_digest is not None and local_digest != remote_digest:
+            mismatch_details.append(f"{name}: sample_digest local={local_digest} seed={remote_digest}")
+
+    for name in remote_tensors:
+        if name not in local_tensors:
+            mismatch_details.append(f"{name}: missing on receiver")
+
+    if mismatch_details:
+        logger.error(
+            "RFork tensor debug verify failed, local matched/returned=%s/%s, "
+            "seed matched/returned=%s/%s, mismatches: %s",
+            local_info.get("matched_count"),
+            local_info.get("returned_count"),
+            remote_info.get("matched_count"),
+            remote_info.get("returned_count"),
+            mismatch_details[:8],
+        )
+        return False
+
+    logger.info(
+        "RFork tensor debug verify passed, patterns=%s, tensors=%d/%d",
+        _normalize_debug_patterns(patterns),
+        local_info.get("returned_count"),
+        local_info.get("matched_count"),
+    )
+    return True

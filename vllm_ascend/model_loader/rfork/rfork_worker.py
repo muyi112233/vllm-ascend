@@ -22,6 +22,7 @@ from vllm_ascend.model_loader.rfork.seed_protocol import RForkSeedProtocol
 from vllm_ascend.model_loader.rfork.seed_server import start_rfork_server
 from vllm_ascend.model_loader.rfork.transfer_backend import (
     RForkTransferBackend,
+    collect_tensor_debug_info,
 )
 
 
@@ -38,6 +39,7 @@ class RForkWorker:
         seed_timeout_sec: float = 30.0,
         seed_key_separator: str = "$",
         is_draft_model: bool = False,
+        debug_verify_patterns: list[str] | str | None = None,
     ):
         self.device_id = device_id
         self.rfork_seed = None
@@ -45,6 +47,7 @@ class RForkWorker:
         self.ready_to_start_seed_service = False
         self.seed_service_started = False
         self.seed_timeout_sec = seed_timeout_sec
+        self.debug_verify_patterns = debug_verify_patterns
         self.seed_protocol = RForkSeedProtocol(
             disaggregation_mode=disaggregation_mode,
             node_rank=node_rank,
@@ -86,6 +89,7 @@ class RForkWorker:
                 seed_instance_ip=self.rfork_seed["seed_ip"],
                 seed_instance_service_port=self.rfork_seed["seed_port"],
                 local_seed_key=self.seed_protocol.get_local_seed_key(),
+                debug_verify_patterns=self.debug_verify_patterns,
             )
         except AssertionError as e:
             logger.exception(
@@ -123,6 +127,11 @@ class RForkWorker:
                 self.transfer_backend.rfork_transfer_engine_weights_info_dict,
             ),
             health_timeout_sec=self.seed_timeout_sec,
+            tensor_debug_info_getter=lambda patterns, limit: collect_tensor_debug_info(
+                model,
+                patterns=patterns,
+                limit=limit,
+            ),
         )
         if port <= 0:
             logger.warning("start_seed_service failed for device_id=%s", self.device_id)

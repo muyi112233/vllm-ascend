@@ -63,22 +63,32 @@ class RForkModelLoader(BaseModelLoader):
 
             return parsed_value
 
+        def _get_extra_config_list(key: str) -> list[str]:
+            value = config.get(key)
+            if isinstance(value, str):
+                return [item.strip() for item in value.split(",") if item.strip()]
+            if isinstance(value, list):
+                return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+            return []
+
         self.model_url = _get_extra_config("model_url", "")
         self.model_deploy_strategy_name = _get_extra_config("model_deploy_strategy_name", "")
         self.scheduler_url = _get_extra_config("rfork_scheduler_url", "")
         self.seed_timeout_sec = _get_extra_config_float("rfork_seed_timeout_sec", 5.0)
         self.seed_key_separator = _get_extra_config("rfork_seed_key_separator", "$")
+        self.debug_verify_patterns = _get_extra_config_list("rfork_debug_verify_patterns")
 
         logger.info(
             "Initializing rfork with config: "
             "MODEL_URL=%s, MODEL_DEPLOY_STRATEGY_NAME=%s, "
             "SCHEDULER_URL=%s, SEED_TIMEOUT_SEC=%s, "
-            "SEED_KEY_SEPARATOR=%s",
+            "SEED_KEY_SEPARATOR=%s, DEBUG_VERIFY_PATTERNS=%s",
             self.model_url,
             self.model_deploy_strategy_name,
             self.scheduler_url,
             self.seed_timeout_sec,
             self.seed_key_separator,
+            self.debug_verify_patterns,
         )
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -108,6 +118,7 @@ class RForkModelLoader(BaseModelLoader):
                 seed_timeout_sec=self.seed_timeout_sec,
                 seed_key_separator=self.seed_key_separator,
                 is_draft_model=is_draft_model,
+                debug_verify_patterns=self.debug_verify_patterns,
             )
             logger.info("RFork worker initialized, load_format=rfork")
             rfork_worker = self.load_config.rfork_worker

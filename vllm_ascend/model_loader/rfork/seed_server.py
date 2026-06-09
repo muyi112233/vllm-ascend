@@ -31,6 +31,7 @@ def start_fastapi_server(
     port_queue: queue.Queue[int],
     local_seed_key,
     info,
+    tensor_debug_info_getter=None,
 ):
     logger.info("[RFork Seed] Preparing socket with dynamic port...")
 
@@ -46,6 +47,17 @@ def start_fastapi_server(
         if seed_key == local_seed_key:
             return {"rfork_transfer_engine_info": info}
         return {"rfork_transfer_engine_info": None}
+
+    @app.get("/debug/rfork_tensor_info")
+    def get_rfork_tensor_info(seed_key: str, patterns: str = "", limit: int = 32):
+        if seed_key != local_seed_key or tensor_debug_info_getter is None:
+            return {"rfork_tensor_info": None}
+        return {
+            "rfork_tensor_info": tensor_debug_info_getter(
+                patterns=patterns,
+                limit=limit,
+            )
+        }
 
     @app.get("/rfork_fetch_seed")
     def rfork_fetch_seed():
@@ -72,11 +84,16 @@ def start_fastapi_server(
     sock.close()
 
 
-def start_rfork_server(local_seed_key, rfork_transfer_engine_info, health_timeout_sec: float = 30.0) -> int:
+def start_rfork_server(
+    local_seed_key,
+    rfork_transfer_engine_info,
+    health_timeout_sec: float = 30.0,
+    tensor_debug_info_getter=None,
+) -> int:
     port_queue: queue.Queue[int] = queue.Queue()
     process = threading.Thread(
         target=start_fastapi_server,
-        args=(port_queue, local_seed_key, rfork_transfer_engine_info),
+        args=(port_queue, local_seed_key, rfork_transfer_engine_info, tensor_debug_info_getter),
         daemon=True,
     )
     process.start()
