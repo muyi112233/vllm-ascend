@@ -18,6 +18,7 @@ import threading
 
 from vllm.logger import logger
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.model_loader.rfork.seed_protocol import RForkSeedProtocol
 from vllm_ascend.model_loader.rfork.seed_server import start_rfork_server
 from vllm_ascend.model_loader.rfork.transfer_backend import (
@@ -55,6 +56,10 @@ class RForkWorker:
             seed_key_separator=seed_key_separator,
             is_draft_worker=is_draft_model,
         )
+        self.fallback_model_path: str | None = None
+        self._fallback_path_thread: threading.Thread | None = None
+        self._fallback_path_error: Exception | None = None
+        self._fallback_path_lock = threading.Lock()
 
     def is_seed_available(self) -> bool:
         self.rfork_seed = self.seed_protocol.get_seed()
@@ -137,3 +142,51 @@ class RForkWorker:
         self.rfork_heartbeat_thread.start()
         logger.info("Seed service started for device_id=%s, port=%s", self.device_id, port)
         self.seed_service_started = True
+
+    def prefetch_fallback_model_path(self) -> None:
+        """Resolve the fallback model path in the background."""
+        if not envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
+            return
+
+        with self._fallback_path_lock:
+            if self.fallback_model_path is not None:
+                return
+            if self._fallback_path_thread is not None and self._fallback_path_thread.is_alive():
+                return
+
+            self._fallback_path_error = None
+            self._fallback_path_thread = threading.Thread(
+                target=self._resolve_fallback_model_path,
+                daemon=True,
+                name="RForkFallbackPathResolver",
+            )
+            self._fallback_path_thread.start()
+
+    def _resolve_fallback_model_path(self) -> None:
+        try:
+            from vllm_ascend.model_loader.async_mount import get_model_path
+
+            self.fallback_model_path = get_model_path(with_weights=True)
+            if self.fallback_model_path:
+                logger.info("Resolved RFork fallback model path: %s", self.fallback_model_path)
+            else:
+                logger.warning("Async model mount did not return a fallback model path.")
+        except Exception as exc:
+            self._fallback_path_error = exc
+            logger.exception("Failed to resolve RFork fallback model path.")
+
+    def get_fallback_model_path(self) -> str | None:
+        """Return the fallback model path, waiting for prefetch if needed."""
+        if not envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
+            return None
+
+        thread = self._fallback_path_thread
+        if thread is None:
+            self._resolve_fallback_model_path()
+        else:
+            thread.join()
+
+        if self._fallback_path_error is not None:
+            raise RuntimeError("Failed to resolve RFork fallback model path.") from self._fallback_path_error
+
+        return self.fallback_model_path

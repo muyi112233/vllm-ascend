@@ -32,6 +32,7 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.model_loader.rfork.rfork_worker import RForkWorker
 
 
@@ -111,6 +112,7 @@ class RForkModelLoader(BaseModelLoader):
             )
             logger.info("RFork worker initialized, load_format=rfork")
             rfork_worker = self.load_config.rfork_worker
+        rfork_worker.prefetch_fallback_model_path()
         return rfork_worker
 
     def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
@@ -180,6 +182,21 @@ class RForkModelLoader(BaseModelLoader):
 
                 self.load_config.load_format = "auto"
                 self.load_config.model_loader_extra_config = {}
+
+                if envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
+                    fallback_model_path = rfork_worker.get_fallback_model_path()
+                    if fallback_model_path:
+                        model_config.model = fallback_model_path
+                        logger.info(
+                            "RFork fallback uses async mounted model path: %s",
+                            fallback_model_path,
+                        )
+                    else:
+                        logger.warning(
+                            "Async model mount is enabled but no fallback model path was resolved; "
+                            "using original model path: %s",
+                            model_config.model,
+                        )
 
                 from vllm.model_executor.model_loader import get_model
 

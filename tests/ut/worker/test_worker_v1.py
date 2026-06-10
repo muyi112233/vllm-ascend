@@ -1050,6 +1050,54 @@ class TestNPUWorker(TestBase):
             # Verify calls
             worker.model_runner.load_model.assert_called_once()
 
+    @patch.dict("os.environ", {"VLLM_ASCEND_ASYNC_MODEL_MOUNT": "1"})
+    @patch("vllm_ascend.model_loader.async_mount.get_model_path")
+    def test_load_model_resolves_async_model_mount_path(self, mock_get_model_path):
+        """Test load_model resolves async mount path for non-rfork loaders"""
+        from vllm_ascend.worker.worker import NPUWorker
+
+        mock_get_model_path.return_value = "/mounted/model"
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.model_runner = MagicMock()
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.load_config = MagicMock()
+            worker.vllm_config.load_config.load_format = "auto"
+            worker.vllm_config.model_config = MagicMock()
+            worker.vllm_config.model_config.enable_sleep_mode = False
+            worker.vllm_config.model_config.model = "/original/model"
+            worker.model_config = worker.vllm_config.model_config
+
+            worker.load_model()
+
+            mock_get_model_path.assert_called_once_with(with_weights=True)
+            self.assertEqual(worker.model_config.model, "/mounted/model")
+            worker.model_runner.load_model.assert_called_once()
+
+    @patch.dict("os.environ", {"VLLM_ASCEND_ASYNC_MODEL_MOUNT": "1"})
+    @patch("vllm_ascend.model_loader.async_mount.get_model_path")
+    def test_load_model_skips_async_model_mount_for_rfork(self, mock_get_model_path):
+        """Test load_model leaves async mount fallback to rfork loader"""
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.model_runner = MagicMock()
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.load_config = MagicMock()
+            worker.vllm_config.load_config.load_format = "rfork"
+            worker.vllm_config.model_config = MagicMock()
+            worker.vllm_config.model_config.enable_sleep_mode = False
+            worker.vllm_config.model_config.model = "/original/model"
+            worker.model_config = worker.vllm_config.model_config
+
+            worker.load_model()
+
+            mock_get_model_path.assert_not_called()
+            self.assertEqual(worker.model_config.model, "/original/model")
+            worker.model_runner.load_model.assert_called_once()
+
     @patch("vllm_ascend.worker.worker.CaMemAllocator")
     def test_load_model_sleep_mode_assertion_error(self, mock_allocator_class):
         """Test load_model method - assertion error in sleep mode"""

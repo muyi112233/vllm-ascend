@@ -107,6 +107,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # Whether to enable async model mount through an external model-manager service.
+    # Valid values: 0 disables this feature, 1 enables it. Default: 0.
+    # Sensitive: no.
+    "VLLM_ASCEND_ASYNC_MODEL_MOUNT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "0"))
+    ),
 }
 
 # end-env-vars-definition
