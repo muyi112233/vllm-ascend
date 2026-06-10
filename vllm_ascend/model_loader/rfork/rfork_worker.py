@@ -121,6 +121,7 @@ class RForkWorker:
             (
                 self.transfer_backend.rfork_transfer_engine_session_id,
                 self.transfer_backend.rfork_transfer_engine_weights_info_dict,
+                self.transfer_backend.rfork_transfer_engine_weights_shape_dict,
             ),
             health_timeout_sec=self.seed_timeout_sec,
         )

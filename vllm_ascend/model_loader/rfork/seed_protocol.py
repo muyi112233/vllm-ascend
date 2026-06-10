@@ -180,7 +180,7 @@ class RForkSeedProtocol:
             self._ensure_scheduler_url_set()
             seed_ip = get_ip()
             seed_key = self.get_local_seed_key()
-            logger.info("[rfork_heartbeat] reporting seed key: %s", seed_key)
+            logger.debug("[rfork_heartbeat] reporting seed key: %s", seed_key)
         except Exception as e:
             logger.exception("report_seed setup Exception: %s", e)
             return
@@ -203,14 +203,23 @@ class RForkSeedProtocol:
                 if response.status_code == 200:
                     result = True
             except HTTPError as e:
-                logger.exception("report_seed to planner HTTPError: %s", e)
+                logger.warning("report_seed to planner HTTPError: %s", e)
             except Exception as e:
-                logger.exception("report_seed to planner Exception: %s", e)
+                logger.warning("report_seed to planner Exception: %s", e)
 
             # Keep heartbeat frequency unchanged, but reduce log noise.
-            # Always print failures immediately; print success once every N times.
-            if (not result) or (heartbeat_idx % log_every_n == 0):
-                logger.info(
+            # Always print failures immediately; keep success in debug logs.
+            if result:
+                if heartbeat_idx % log_every_n == 0:
+                    logger.debug(
+                        "[rfork_heartbeat] report seed to planner result: %s (%d/%d), seed_key=%s",
+                        result,
+                        heartbeat_idx % log_every_n if heartbeat_idx % log_every_n != 0 else log_every_n,
+                        log_every_n,
+                        seed_key,
+                    )
+            else:
+                logger.warning(
                     "[rfork_heartbeat] report seed to planner result: %s (%d/%d), seed_key=%s",
                     result,
                     heartbeat_idx % log_every_n if heartbeat_idx % log_every_n != 0 else log_every_n,
