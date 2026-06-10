@@ -17,6 +17,7 @@
 import gc
 import os
 import time
+from copy import copy
 
 import torch
 import torch.nn as nn
@@ -78,6 +79,13 @@ def _is_draft_model(vllm_config: VllmConfig, model_config: ModelConfig | None = 
 
 def _get_rfork_worker_attr(vllm_config: VllmConfig, model_config: ModelConfig) -> str:
     return "rfork_draft_worker" if _is_draft_model(vllm_config, model_config) else "rfork_worker"
+
+
+def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
+    fallback_load_config = copy(load_config)
+    fallback_load_config.load_format = "auto"
+    fallback_load_config.model_loader_extra_config = {}
+    return fallback_load_config
 
 
 @register_model_loader("rfork")
@@ -233,8 +241,7 @@ class RForkModelLoader(BaseModelLoader):
                         gc.collect()
                         torch.npu.empty_cache()
 
-                self.load_config.load_format = "auto"
-                self.load_config.model_loader_extra_config = {}
+                fallback_load_config = _make_fallback_load_config(self.load_config)
 
                 from vllm.model_executor.model_loader import get_model
 
@@ -242,7 +249,7 @@ class RForkModelLoader(BaseModelLoader):
                     model = get_model(
                         vllm_config=vllm_config,
                         model_config=model_config,
-                        load_config=self.load_config,
+                        load_config=fallback_load_config,
                         prefix=prefix,
                     )
                 except Exception:

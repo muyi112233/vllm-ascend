@@ -100,15 +100,18 @@ class RForkSeedProtocol:
     def get_seed(self):
         try:
             self._ensure_scheduler_url_set()
+            seed_key = self.get_local_seed_key()
             response = requests.get(
                 f"{self.scheduler_url}/get_seed",
                 headers={
-                    "SEED_KEY": self.get_local_seed_key(),
+                    "SEED_KEY": seed_key,
                 },
                 timeout=self._request_timeout_sec(),
             )
             if response.status_code != 200:
-                raise RuntimeError(f"Failed to get seed from the planner, {response.status_code}")
+                raise RuntimeError(
+                    f"Failed to get seed from the planner, {response.status_code}, seed_key={seed_key!r}"
+                )
 
             seed_ip = response.headers.get("SEED_IP")
             seed_port = response.headers.get("SEED_PORT")
@@ -177,6 +180,7 @@ class RForkSeedProtocol:
             self._ensure_scheduler_url_set()
             seed_ip = get_ip()
             seed_key = self.get_local_seed_key()
+            logger.info("[rfork_heartbeat] reporting seed key: %s", seed_key)
         except Exception as e:
             logger.exception("report_seed setup Exception: %s", e)
             return
@@ -207,9 +211,10 @@ class RForkSeedProtocol:
             # Always print failures immediately; print success once every N times.
             if (not result) or (heartbeat_idx % log_every_n == 0):
                 logger.info(
-                    "[rfork_heartbeat] report seed to planner result: %s (%d/%d)",
+                    "[rfork_heartbeat] report seed to planner result: %s (%d/%d), seed_key=%s",
                     result,
                     heartbeat_idx % log_every_n if heartbeat_idx % log_every_n != 0 else log_every_n,
                     log_every_n,
+                    seed_key,
                 )
             time.sleep(sleep_interval)

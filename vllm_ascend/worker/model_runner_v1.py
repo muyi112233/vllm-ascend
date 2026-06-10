@@ -4444,7 +4444,8 @@ def _torch_cuda_wrapper():
         torch.cuda.stream = _StreamPlaceholder
         torch.cuda.synchronize = _StreamPlaceholder
         torch.cuda.mem_get_info = _StreamPlaceholder
-        raise RuntimeError(f"NPUModelRunner init failed, error is {e}")
+        logger.exception("NPUModelRunner init failed.")
+        raise RuntimeError(f"NPUModelRunner init failed, error is {e}") from e
     finally:
         # if anything goes wrong, just patch it with a placeholder
         torch.cuda.Event = _EventPlaceholder
@@ -4464,7 +4465,8 @@ def _replace_gpu_model_runner_function_wrapper(target_module_name):
         setattr(target_module, "graph_capture", graph_capture)  # noqa: B010
         yield
     except Exception as e:
-        raise RuntimeError(f"NPUModelRunner failed, error is {e}")
+        logger.exception("NPUModelRunner failed.")
+        raise RuntimeError(f"NPUModelRunner failed, error is {e}") from e
     finally:
         setattr(target_module, "graph_capture", graph_capture)  # noqa: B010
 

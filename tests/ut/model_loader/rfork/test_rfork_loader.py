@@ -22,6 +22,7 @@ from vllm_ascend.model_loader.rfork.rfork_loader import (
     RForkModelLoader,
     _get_rfork_worker_attr,
     _is_draft_model,
+    _make_fallback_load_config,
 )
 
 
@@ -132,3 +133,16 @@ def test_rfork_uses_separate_worker_attr_for_explicit_draft_model_config():
 
     assert _get_rfork_worker_attr(target_vllm_config, target_vllm_config.model_config) == "rfork_worker"
     assert _get_rfork_worker_attr(target_vllm_config, draft_model_config) == "rfork_draft_worker"
+
+
+def test_rfork_fallback_load_config_copy_does_not_mutate_original():
+    original_extra_config = {"model_url": "model", "model_deploy_strategy_name": "tp8"}
+    load_config = DummyLoadConfig(original_extra_config)
+
+    fallback_load_config = _make_fallback_load_config(load_config)
+
+    assert fallback_load_config is not load_config
+    assert fallback_load_config.load_format == "auto"
+    assert fallback_load_config.model_loader_extra_config == {}
+    assert load_config.load_format == "rfork"
+    assert load_config.model_loader_extra_config == original_extra_config
