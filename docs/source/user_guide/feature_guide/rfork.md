@@ -45,7 +45,7 @@ To enable RFork, pass `--load-format rfork` and provide RFork settings through `
 | **model_url** | String | Logical model identifier used to build the RFork seed key. | Required for RFork transfer. Instances that should share seeds must use the same value. |
 | **model_deploy_strategy_name** | String | Deployment strategy identifier used together with `model_url` to build the seed key. | Required for RFork transfer. Instances that should share seeds must use the same value. |
 | **rfork_scheduler_url** | String | Base URL of the planner service used for seed allocation, release, and heartbeat. | Required for planner-based matching. Example: `http://127.0.0.1:1223`. |
-| **rfork_seed_timeout_sec** | Number | Timeout for waiting until the local seed HTTP service becomes healthy after startup. | Optional. Default: `30`. Must be greater than `0`. |
+| **rfork_seed_timeout_sec** | Number | Timeout for waiting until the local seed HTTP service becomes healthy after startup. | Optional. Default: `5.0`. Must be greater than `0`. Invalid values fall back to the default. |
 | **rfork_seed_key_separator** | String | Separator used when building the RFork seed key string. | Optional. Default: `$`. Keep the same value across compatible instances. |
 
 ### How RFork Matches Seeds
@@ -60,6 +60,32 @@ RFork does not match instances by `model_url` alone. The local seed key is compo
 - optional `draft` suffix when the worker runs as a draft model
 
 This means two instances must agree on both model identity and deployment topology before the planner will treat them as interchangeable seeds.
+
+### Quantized Models
+
+For quantized models, RFork transfers tensors after Ascend weight post-processing instead of raw checkpoint parameters. The receiver first builds the same post-load tensor layout as the seed, then RFork copies the live NPU tensors used by inference.
+
+This path handles Ascend quantization changes such as weight transposition, NZ format conversion, packed weights, derived scale tensors, and MLA/SFA runtime tensors such as `W_UV` and `W_UK_T`. Empty tensors that were released during post-processing are not included in the transfer manifest.
+
+When validating RFork for a quantized model:
+
+- Apply the same vLLM Ascend code to both the seed instance and the receiver instance.
+- Restart the planner and all vLLM instances after changing RFork code, because existing seeds keep their old transfer metadata.
+- Use a new `model_deploy_strategy_name` after changing model arguments or RFork code, so the planner does not match a receiver with an incompatible old seed.
+- A successful RFork transfer logs `transfer weights starts` and `transfer weights time`. The fallback path logs `RFork transfer failed`.
+
+## Tested Models
+
+The following table records models that have been explicitly tested with RFork weight transfer. A model should be added here only after RFork transfer succeeds and the loaded instance passes basic inference validation.
+
+| Model | Precision / Quantization | Hardware | Validation Status | Notes |
+|-------|--------------------------|----------|-------------------|-------|
+| Qwen2.5-7B | BF16 | A2 | Tested | RFork transfer has been validated. |
+| Qwen3-32B | BF16 | A2 | Tested | RFork transfer has been validated. |
+| Qwen3-235B-A22B | BF16 | A2 | Tested | RFork transfer has been validated. |
+| DeepSeek-V4-Flash-W8A8-MTP | W8A8 | A2 | Tested | RFork transfer with MTP draft model has been validated. |
+| GLM5-W4A8 | W4A8 | A2 | Tested | RFork transfer has been validated. |
+| Kimi2.5-W4A8 | W4A8 | A2 | Tested | RFork transfer has been validated. |
 
 ---
 
@@ -93,15 +119,15 @@ For later instances, if the planner can allocate a compatible seed, RFork will t
 
 ```shell
 export RFORK_CONFIG='{
-  "model_url": "`<model_url>`",
-  "model_deploy_strategy_name": "`<deploy_strategy>`",
-  "rfork_scheduler_url": "http://`<planner_ip>`:`<planner_port>`"
+  "model_url": "<model_url>",
+  "model_deploy_strategy_name": "<deploy_strategy>",
+  "rfork_scheduler_url": "http://<planner_ip>:<planner_port>"
 }'
 
 vllm serve <model_path> \
   --tensor-parallel-size 1 \
-  --served-model-name `<served_model_name>` \
-  --port `<port>` \
+  --served-model-name <served_model_name> \
+  --port <port> \
   --load-format rfork \
   --model-loader-extra-config "${RFORK_CONFIG}"
 ```
