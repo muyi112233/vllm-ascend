@@ -1,0 +1,498 @@
+From 8b61e182f52ed6f8ba886e005553e7f3e8ed7baf Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Sat, 6 Jun 2026 15:57:24 +0800
+Subject: [PATCH 1/2] fix(rfork): support quantized model transfer
+
+Align receiver tensors with Ascend post-load quantized layouts before RFork transfer.
+
+- vLLM version: v0.20.2
+- vLLM main:
+https://github.com/vllm-project/vllm/commit/9090368b650896bf5fc990c921df7eb4c20355a5
+
+---------
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ docs/source/user_guide/feature_guide/rfork.md |  13 ++
+ .../model_loader/rfork/rfork_loader.py        |  13 +-
+ .../model_loader/rfork/rfork_worker.py        |  40 +++-
+ .../model_loader/rfork/transfer_backend.py    | 217 ++++++++++++++++--
+ 4 files changed, 252 insertions(+), 31 deletions(-)
+
+diff --git a/docs/source/user_guide/feature_guide/rfork.md b/docs/source/user_guide/feature_guide/rfork.md
+index 35e4af2d..7bf949f6 100644
+--- a/docs/source/user_guide/feature_guide/rfork.md
++++ b/docs/source/user_guide/feature_guide/rfork.md
+@@ -61,6 +61,19 @@ RFork does not match instances by `model_url` alone. The local seed key is compo
+ 
+ This means two instances must agree on both model identity and deployment topology before the planner will treat them as interchangeable seeds.
+ 
++### Quantized Models
++
++For quantized models, RFork transfers tensors after Ascend weight post-processing instead of raw checkpoint parameters. The receiver first builds the same post-load tensor layout as the seed, then RFork copies the live NPU tensors used by inference.
++
++This path handles Ascend quantization changes such as weight transposition, NZ format conversion, packed weights, derived scale tensors, and MLA/SFA runtime tensors such as `W_UV` and `W_UK_T`. Empty tensors that were released during post-processing are not included in the transfer manifest.
++
++When validating RFork for a quantized model:
++
++- Apply the same vLLM Ascend code to both the seed instance and the receiver instance.
++- Restart the planner and all vLLM instances after changing RFork code, because existing seeds keep their old transfer metadata.
++- Use a new `model_deploy_strategy_name` after changing model arguments or RFork code, so the planner does not match a receiver with an incompatible old seed.
++- A successful RFork transfer logs `transfer weights starts` and `transfer weights time`. The fallback path logs `RFork transfer failed`.
++
+ ---
+ 
+ ## Example Commands & Placeholders
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 8c94ca43..8bc8305b 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -113,6 +113,9 @@ class RForkModelLoader(BaseModelLoader):
+             rfork_worker = self.load_config.rfork_worker
+         return rfork_worker
+ 
++    def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
++        return getattr(model_config, "quantization", None) is not None
++
+     def load_model(
+         self,
+         vllm_config: VllmConfig,
+@@ -127,6 +130,7 @@ class RForkModelLoader(BaseModelLoader):
+         with set_default_torch_dtype(model_config.dtype):
+             need_del = False
+             rfork_worker = self._ensure_rfork_worker(vllm_config)
++            processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
+             try:
+                 if not rfork_worker.is_seed_available():
+                     raise RuntimeError("seed is not available.")
+@@ -139,6 +143,10 @@ class RForkModelLoader(BaseModelLoader):
+                     )
+                     need_del = True
+ 
++                if processed_layout_transfer:
++                    logger.info("RFork uses post-load tensor layout transfer for quantized model.")
++                    process_weights_after_loading(model, model_config, target_device)
++
+                 weight_load_start_time = time.time()
+                 if not rfork_worker.pre_transfer(model):
+                     raise RuntimeError("pre_transfer failed.")
+@@ -152,13 +160,15 @@ class RForkModelLoader(BaseModelLoader):
+                 )
+ 
+                 rfork_worker.start_seed_service(model)
+-                process_weights_after_loading(model, model_config, target_device)
++                if not processed_layout_transfer:
++                    process_weights_after_loading(model, model_config, target_device)
+ 
+                 return model.eval()
+             except Exception as e:
+                 logger.warning(f"RFork transfer failed: {e}, clean up and fall back to default loader")
+ 
+                 rfork_worker.post_transfer()
++                rfork_worker.reset_transfer_state()
+ 
+                 if need_del:
+                     del model
+@@ -179,6 +189,7 @@ class RForkModelLoader(BaseModelLoader):
+                     prefix=prefix,
+                 )
+                 try:
++                    rfork_worker.reset_transfer_state()
+                     rfork_worker.start_seed_service(model)
+                 except Exception as e:
+                     logger.warning(
+diff --git a/vllm_ascend/model_loader/rfork/rfork_worker.py b/vllm_ascend/model_loader/rfork/rfork_worker.py
+index b342f667..9cc6d14b 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_worker.py
++++ b/vllm_ascend/model_loader/rfork/rfork_worker.py
+@@ -67,9 +67,16 @@ class RForkWorker:
+             self.ready_to_start_seed_service = result
+             return result
+         except AssertionError as e:
+-            logger.exception("Pre-transfer failed: %s", e)
++            logger.exception("Pre-transfer failed for device_id=%s: %s", self.device_id, e)
+             return False
+ 
++    def reset_transfer_state(self) -> None:
++        try:
++            self.transfer_backend.unregister_memory_region()
++        except Exception as e:
++            logger.warning("Failed to unregister rfork memory region: %s", e)
++        self.ready_to_start_seed_service = False
++
+     def transfer(self, model) -> bool:
+         try:
+             assert self.transfer_backend.is_initialized(), "transfer_backend is not initialized, cannot transfer."
+@@ -81,7 +88,11 @@ class RForkWorker:
+                 local_seed_key=self.seed_protocol.get_local_seed_key(),
+             )
+         except AssertionError as e:
+-            logger.exception("Transfer failed: %s", e)
++            logger.exception(
++                "Transfer failed for device_id=%s: %s",
++                self.device_id,
++                e,
++            )
+             return False
+ 
+     def post_transfer(self):
+@@ -89,6 +100,7 @@ class RForkWorker:
+             logger.info("rfork seed is None, no need to release.")
+             return True
+         self.seed_protocol.release_seed(self.rfork_seed)
++        self.rfork_seed = None
+         return True
+ 
+     def start_seed_service(self, model):
+@@ -98,6 +110,10 @@ class RForkWorker:
+ 
+         if not self.ready_to_start_seed_service:
+             if not self.pre_transfer(model):
++                logger.warning(
++                    "start_seed_service aborted for device_id=%s: pre_transfer failed",
++                    self.device_id,
++                )
+                 return
+ 
+         port = start_rfork_server(
+@@ -108,12 +124,16 @@ class RForkWorker:
+             ),
+             health_timeout_sec=self.seed_timeout_sec,
+         )
+-        if port > 0:
+-            self.rfork_heartbeat_thread = threading.Thread(
+-                target=self.seed_protocol.report_seed,
+-                args=(port,),
+-                daemon=True,
+-                name="RForkHeartbeat",
+-            )
+-            self.rfork_heartbeat_thread.start()
++        if port <= 0:
++            logger.warning("start_seed_service failed for device_id=%s", self.device_id)
++            return
++
++        self.rfork_heartbeat_thread = threading.Thread(
++            target=self.seed_protocol.report_seed,
++            args=(port,),
++            daemon=True,
++            name="RForkHeartbeat",
++        )
++        self.rfork_heartbeat_thread.start()
++        logger.info("Seed service started for device_id=%s, port=%s", self.device_id, port)
+         self.seed_service_started = True
+diff --git a/vllm_ascend/model_loader/rfork/transfer_backend.py b/vllm_ascend/model_loader/rfork/transfer_backend.py
+index afb60b75..e019a6ce 100644
+--- a/vllm_ascend/model_loader/rfork/transfer_backend.py
++++ b/vllm_ascend/model_loader/rfork/transfer_backend.py
+@@ -15,13 +15,129 @@
+ #
+ 
+ import time
++from bisect import bisect_left
+ from typing import Any
+ 
+ import requests
+ import torch
++from torch import nn
+ from vllm.logger import logger
+ from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
+ 
++MAX_TRANSFER_CHUNK_BYTES = 1024**3
++MAX_TRANSFER_CHUNK_WEIGHTS = 512
++
++
++def _is_transferable_tensor(tensor: torch.Tensor) -> bool:
++    return not tensor.is_meta and tensor.numel() > 0 and _is_tensor_on_transfer_device(tensor)
++
++
++def _is_tensor_on_transfer_device(tensor: torch.Tensor) -> bool:
++    return tensor.device.type == "npu"
++
++
++def _iter_tensors_in_value(prefix: str, value: Any, visited_object_ids: set[int], scan_objects: bool = False):
++    if isinstance(value, torch.Tensor):
++        yield prefix, value
++        return
++
++    if isinstance(value, (nn.Module, str, bytes)) or callable(value):
++        return
++
++    if isinstance(value, (list, tuple)):
++        for index, item in enumerate(value):
++            yield from _iter_tensors_in_value(f"{prefix}.{index}", item, visited_object_ids, scan_objects)
++        return
++
++    if isinstance(value, dict):
++        for key, item in value.items():
++            yield from _iter_tensors_in_value(f"{prefix}.{key}", item, visited_object_ids, scan_objects)
++        return
++
++    if not scan_objects or not hasattr(value, "__dict__"):
++        return
++
++    value_id = id(value)
++    if value_id in visited_object_ids:
++        return
++    visited_object_ids.add(value_id)
++    for attr_name, attr_value in vars(value).items():
++        if attr_name.startswith("_"):
++            continue
++        yield from _iter_tensors_in_value(f"{prefix}.{attr_name}", attr_value, visited_object_ids, scan_objects)
++
++
++def _iter_transferable_tensors(model: nn.Module):
++    seen_data_ptrs: set[int] = set()
++
++    for name, tensor in model.named_parameters():
++        if _is_transferable_tensor(tensor) and tensor.data_ptr() not in seen_data_ptrs:
++            seen_data_ptrs.add(tensor.data_ptr())
++            yield name, tensor
++
++    for name, tensor in model.named_buffers():
++        if _is_transferable_tensor(tensor) and tensor.data_ptr() not in seen_data_ptrs:
++            seen_data_ptrs.add(tensor.data_ptr())
++            yield name, tensor
++
++    # Some Ascend post-load paths replace checkpoint parameters with runtime
++    # tensors stored as plain module attributes, e.g. MLA/SFA W_UV and W_UK_T.
++    for module_prefix, module in model.named_modules():
++        for attr_name, attr_value in vars(module).items():
++            if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
++                continue
++
++            scan_objects = attr_name == "impl"
++            for tensor_name, tensor in _iter_tensors_in_value(attr_name, attr_value, set(), scan_objects):
++                if not _is_transferable_tensor(tensor) or tensor.data_ptr() in seen_data_ptrs:
++                    continue
++
++                seen_data_ptrs.add(tensor.data_ptr())
++                full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
++                yield full_name, tensor
++
++
++def _block_contains_weight_ptr(address: int, size: int, sorted_weight_ptrs: list[int]) -> bool:
++    index = bisect_left(sorted_weight_ptrs, address)
++    return index < len(sorted_weight_ptrs) and sorted_weight_ptrs[index] < address + size
++
++
++def _iter_transfer_chunks(
++    weight_names: list[str],
++    seed_ptr_list: list[int],
++    client_ptr_list: list[int],
++    client_len_list: list[int],
++):
++    chunk_start = 0
++    chunk_bytes = 0
++    chunk_weights = 0
++
++    for index, length in enumerate(client_len_list):
++        should_flush = chunk_weights > 0 and (
++            chunk_bytes + length > MAX_TRANSFER_CHUNK_BYTES or chunk_weights >= MAX_TRANSFER_CHUNK_WEIGHTS
++        )
++        if should_flush:
++            yield (
++                weight_names[chunk_start:index],
++                seed_ptr_list[chunk_start:index],
++                client_ptr_list[chunk_start:index],
++                client_len_list[chunk_start:index],
++            )
++            chunk_start = index
++            chunk_bytes = 0
++            chunk_weights = 0
++
++        chunk_bytes += length
++        chunk_weights += 1
++
++    if chunk_weights > 0:
++        yield (
++            weight_names[chunk_start:],
++            seed_ptr_list[chunk_start:],
++            client_ptr_list[chunk_start:],
++            client_len_list[chunk_start:],
++        )
++
+ 
+ class RForkTransferBackend:
+     def __init__(self):
+@@ -36,17 +152,24 @@ class RForkTransferBackend:
+         try:
+             from yr.datasystem import TransferEngine  # type: ignore[import-not-found]
+         except ImportError as e:
+-            raise ImportError("Please install @yuanrong-datasystem/transfer_engine first.") from e
++            err_msg = (
++                "Failed to import TransferEngine from yr.datasystem. "
++                "Please install @yuanrong-datasystem/transfer_engine."
++            )
++            logger.error(err_msg)
++            raise ImportError(err_msg) from e
+ 
+         transfer_engine = TransferEngine()
+         local_hostname = join_host_port(get_ip(), get_open_port())
+         ret = transfer_engine.initialize(local_hostname, "ascend", f"npu:{torch.npu.current_device()}")
+         if ret.is_error():
+-            raise RuntimeError(
+-                "TransferEngine initialization failed: "
+-                f"initialize({local_hostname}, ascend"
+-                f"npu:{int(torch.npu.current_device())}) -> {ret.to_string()}"
++            err_msg = (
++                f"TransferEngine initialization failed: "
++                f"initialize({local_hostname}, 'ascend', "
++                f"'npu:{int(torch.npu.current_device())}') -> {ret.to_string()}"
+             )
++            logger.error(err_msg)
++            raise RuntimeError(err_msg)
+ 
+         self.rfork_transfer_engine = transfer_engine
+         self.rfork_transfer_engine_session_id = local_hostname
+@@ -66,13 +189,14 @@ class RForkTransferBackend:
+ 
+         weight_mr_dict = {}
+         weight_addr_set = set()
+-        for name, weight in model.named_parameters():
++        for name, weight in _iter_transferable_tensors(model):
+             weight_mr_dict[name] = (
+                 weight.data_ptr(),
+                 weight.numel(),
+                 weight.element_size(),
+             )
+             weight_addr_set.add(weight.data_ptr())
++        sorted_weight_ptrs = sorted(weight_addr_set)
+ 
+         memory_snapshot = torch.npu.memory.memory_snapshot()
+         weight_blocks_for_reg_mr = []
+@@ -84,7 +208,7 @@ class RForkTransferBackend:
+                 state = block.get("state", "")
+                 if address < 0 or size < 0 or state == "":
+                     continue
+-                if state == "active_allocated" and address in weight_addr_set:
++                if state == "active_allocated" and _block_contains_weight_ptr(address, size, sorted_weight_ptrs):
+                     if current_weight_block is None:
+                         current_weight_block = (address, size)
+                     elif current_weight_block[0] + current_weight_block[1] == address:
+@@ -112,14 +236,20 @@ class RForkTransferBackend:
+         self.registered_weight_blocks = weight_blocks_for_reg_mr
+ 
+         logger.info(
+-            "register_memory_region time: %.4fs",
++            "register_memory_region time: %.4fs, weights: %d",
+             time.time() - start_reg_mr_tic,
++            len(weight_mr_dict),
+         )
+         return True
+ 
+     def unregister_memory_region(self) -> bool:
+         transfer_engine = self._get_transfer_engine()
+         start_unreg_mr_tic = time.time()
++        if not self.registered_weight_blocks:
++            self.rfork_transfer_engine_weights_info_dict = None
++            logger.debug("unregister_memory_region skipped because no blocks are registered.")
++            return True
++
+         ret = transfer_engine.batch_unregister_memory([address for address, _ in self.registered_weight_blocks])
+         if ret.is_error():
+             logger.error(
+@@ -153,7 +283,8 @@ class RForkTransferBackend:
+         seed_ptr_list = []
+         client_ptr_list = []
+         client_len_list = []
+-        for name, tensor in model.named_parameters():
++        weight_names = []
++        for name, tensor in _iter_transferable_tensors(model):
+             weight_info = seed_weight_info.get(name, None)
+             if weight_info is None:
+                 logger.error("Cannot find weight info for %s.", name)
+@@ -174,17 +305,56 @@ class RForkTransferBackend:
+             seed_ptr_list.append(seed_ptr)
+             client_ptr_list.append(tensor.data_ptr())
+             client_len_list.append(tensor.numel() * tensor.element_size())
++            weight_names.append(name)
+ 
+         start_transfer_tic = time.time()
+-        ret = transfer_engine.batch_transfer_sync_read(
+-            seed_session_id,
+-            client_ptr_list,
+-            seed_ptr_list,
+-            client_len_list,
++        transfer_chunks = list(
++            _iter_transfer_chunks(
++                weight_names,
++                seed_ptr_list,
++                client_ptr_list,
++                client_len_list,
++            )
+         )
+-        if ret.is_error():
+-            logger.error("Failed to transfer weights from remote instance, ret=%s", ret.to_string())
+-            return False
++        logger.info(
++            "transfer weights starts, weights: %d, chunks: %d, total bytes: %.2f GiB",
++            len(client_len_list),
++            len(transfer_chunks),
++            sum(client_len_list) / (1024**3),
++        )
++        for index, (chunk_names, chunk_seed_ptrs, chunk_client_ptrs, chunk_lengths) in enumerate(transfer_chunks, 1):
++            chunk_start_tic = time.time()
++            logger.debug(
++                "transfer weights chunk %d/%d starts, weights: %d, bytes: %.2f GiB, first: %s, last: %s",
++                index,
++                len(transfer_chunks),
++                len(chunk_lengths),
++                sum(chunk_lengths) / (1024**3),
++                chunk_names[0],
++                chunk_names[-1],
++            )
++            ret = transfer_engine.batch_transfer_sync_read(
++                seed_session_id,
++                chunk_client_ptrs,
++                chunk_seed_ptrs,
++                chunk_lengths,
++            )
++            if ret.is_error():
++                logger.error(
++                    "Failed to transfer weights chunk %d/%d, first: %s, last: %s, ret=%s",
++                    index,
++                    len(transfer_chunks),
++                    chunk_names[0],
++                    chunk_names[-1],
++                    ret.to_string(),
++                )
++                return False
++            logger.debug(
++                "transfer weights chunk %d/%d done, time: %.4fs",
++                index,
++                len(transfer_chunks),
++                time.time() - chunk_start_tic,
++            )
+ 
+         logger.info("transfer weights time: %.4fs", time.time() - start_transfer_tic)
+         return True
+@@ -197,7 +367,11 @@ def get_remote_instance_transfer_engine_info(seed_url: str, local_seed_key: str)
+             params={"seed_key": local_seed_key},
+         )
+         if response.status_code != 200:
+-            logger.error("request.get failed: %s", response.status_code)
++            logger.error(
++                "GET %s/get_rfork_transfer_engine_info failed: %s",
++                seed_url,
++                response.status_code,
++            )
+             return None, None
+ 
+         data = response.json()
+@@ -205,8 +379,11 @@ def get_remote_instance_transfer_engine_info(seed_url: str, local_seed_key: str)
+         if info is not None and isinstance(info, list) and len(info) == 2:
+             return info[0], info[1]
+ 
+-        logger.error("Failed to get `rfork_transfer_engine_info` in response.")
++        logger.error(
++            "Failed to get rfork_transfer_engine_info in response from %s.",
++            seed_url,
++        )
+         return None, None
+     except Exception as e:
+-        logger.error("Exception: %s", e)
++        logger.error("Exception getting transfer engine info from %s: %s", seed_url, e)
+         return None, None
+-- 
+2.51.0.windows.1
+

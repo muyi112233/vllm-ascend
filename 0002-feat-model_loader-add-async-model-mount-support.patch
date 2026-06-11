@@ -1,0 +1,802 @@
+From 08fc89d85d0aef6c3d12d7d064485f6d8867bb21 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Wed, 10 Jun 2026 22:09:22 +0800
+Subject: [PATCH 2/2] feat(model_loader): add async model mount support
+
+Add async model-manager path resolution for non-RFork loading and RFork fallback paths. Harden symlink handling for mock async mounts and add focused unit tests for the new behavior.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ examples/async_model_mount/README.md          | 59 ++++++++++++
+ .../model_manager/__init__.py                 |  1 +
+ .../mock_model_manager/model_manager/apis.py  | 82 +++++++++++++++++
+ .../prepare_meta_only_model.py                | 86 +++++++++++++++++
+ .../model_loader/rfork/test_rfork_loader.py   | 29 ++++++
+ .../model_loader/rfork/test_rfork_worker.py   | 79 ++++++++++++++++
+ tests/ut/model_loader/test_async_mount.py     | 49 ++++++++++
+ tests/ut/worker/test_worker_v1.py             | 48 ++++++++++
+ vllm_ascend/envs.py                           |  6 ++
+ vllm_ascend/model_loader/async_mount.py       | 92 +++++++++++++++++++
+ .../model_loader/rfork/rfork_loader.py        | 17 ++++
+ .../model_loader/rfork/rfork_worker.py        | 53 +++++++++++
+ vllm_ascend/worker/worker.py                  | 30 ++++++
+ 13 files changed, 631 insertions(+)
+ create mode 100644 examples/async_model_mount/README.md
+ create mode 100644 examples/async_model_mount/mock_model_manager/model_manager/__init__.py
+ create mode 100644 examples/async_model_mount/mock_model_manager/model_manager/apis.py
+ create mode 100644 examples/async_model_mount/prepare_meta_only_model.py
+ create mode 100644 tests/ut/model_loader/rfork/test_rfork_loader.py
+ create mode 100644 tests/ut/model_loader/rfork/test_rfork_worker.py
+ create mode 100644 tests/ut/model_loader/test_async_mount.py
+ create mode 100644 vllm_ascend/model_loader/async_mount.py
+
+diff --git a/examples/async_model_mount/README.md b/examples/async_model_mount/README.md
+new file mode 100644
+index 00000000..437e70ad
+--- /dev/null
++++ b/examples/async_model_mount/README.md
+@@ -0,0 +1,59 @@
++# Async Model Mount Mock
++
++This example provides a local `model_manager` mock package for testing
++`VLLM_ASCEND_ASYNC_MODEL_MOUNT` without a real model-manager service.
++
++## Files
++
++- `mock_model_manager/model_manager/apis.py`: implements
++  `get_model_path_from_manager(with_weights: bool)`.
++- `prepare_meta_only_model.py`: copies model metadata to a bootstrap model
++  directory while excluding weight files.
++
++## Prepare a Meta-Only Bootstrap Directory
++
++```bash
++python examples/async_model_mount/prepare_meta_only_model.py \
++  --source /mnt/cephfs/models/GLM-5-w4a8 \
++  --target /tmp/async_mount/bootstrap_model
++```
++
++The helper excludes common weight files such as `*.safetensors`, `*.bin`,
++`*.pt`, `*.pth`, and `*.gguf`. It keeps config, tokenizer, index, quantization
++metadata, templates, and small runtime metadata directories.
++
++## Run with the Mock Model Manager
++
++```bash
++export PYTHONPATH="$(pwd)/examples/async_model_mount/mock_model_manager:${PYTHONPATH}"
++export VLLM_ASCEND_ASYNC_MODEL_MOUNT=1
++
++export MOCK_MODEL_META_PATH=/tmp/async_mount/bootstrap_model
++export MOCK_MODEL_WEIGHT_PATH=/tmp/async_mount/mounted_model
++export MOCK_MODEL_READY_FILE=/tmp/async_mount/READY
++
++vllm serve /tmp/async_mount/bootstrap_model
++```
++
++In another terminal, simulate the async mount becoming ready:
++
++```bash
++mkdir -p /tmp/async_mount/mounted_model
++cp -a /mnt/cephfs/models/GLM-5-w4a8/. /tmp/async_mount/mounted_model/
++touch /tmp/async_mount/READY
++```
++
++When `with_weights=False`, the mock returns `MOCK_MODEL_META_PATH`.
++When `with_weights=True`, it waits for `MOCK_MODEL_READY_FILE` if configured,
++then returns `MOCK_MODEL_WEIGHT_PATH`.
++
++## Environment Variables
++
++| Variable | Required | Default | Description |
++| --- | --- | --- | --- |
++| `MOCK_MODEL_META_PATH` | Yes | unset | Path returned for metadata-only access. |
++| `MOCK_MODEL_WEIGHT_PATH` | Yes | unset | Path returned when weights are required. |
++| `MOCK_MODEL_READY_FILE` | No | unset | If set, `with_weights=True` waits for this file. |
++| `MOCK_MODEL_MOUNT_TIMEOUT_SEC` | No | `600` | Max wait time for the ready file. |
++| `MOCK_MODEL_MOUNT_POLL_INTERVAL_SEC` | No | `1` | Ready-file polling interval. |
++| `MOCK_MODEL_VALIDATE_PATH` | No | `1` | Validate returned paths exist when set to `1`. |
+diff --git a/examples/async_model_mount/mock_model_manager/model_manager/__init__.py b/examples/async_model_mount/mock_model_manager/model_manager/__init__.py
+new file mode 100644
+index 00000000..3f45c26d
+--- /dev/null
++++ b/examples/async_model_mount/mock_model_manager/model_manager/__init__.py
+@@ -0,0 +1 @@
++"""Local model_manager mock for async model mount examples."""
+diff --git a/examples/async_model_mount/mock_model_manager/model_manager/apis.py b/examples/async_model_mount/mock_model_manager/model_manager/apis.py
+new file mode 100644
+index 00000000..d82acf3c
+--- /dev/null
++++ b/examples/async_model_mount/mock_model_manager/model_manager/apis.py
+@@ -0,0 +1,82 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++"""Mock model-manager API used by VLLM_ASCEND_ASYNC_MODEL_MOUNT examples."""
++
++import os
++import time
++from pathlib import Path
++
++
++def _get_required_env(name: str) -> str:
++    value = os.getenv(name)
++    if not value:
++        raise RuntimeError(f"{name} must be set for the mock model-manager.")
++    return value
++
++
++def _get_float_env(name: str, default: float) -> float:
++    value = os.getenv(name)
++    if not value:
++        return default
++    try:
++        parsed_value = float(value)
++    except ValueError as exc:
++        raise RuntimeError(f"{name} must be a float value, got {value!r}.") from exc
++    if parsed_value <= 0:
++        raise RuntimeError(f"{name} must be greater than 0, got {value!r}.")
++    return parsed_value
++
++
++def _validate_path(path: str, purpose: str) -> None:
++    if os.getenv("MOCK_MODEL_VALIDATE_PATH", "1") != "1":
++        return
++    if not Path(path).exists():
++        raise FileNotFoundError(f"Mock {purpose} path does not exist: {path}")
++
++
++def _wait_until_ready() -> None:
++    ready_file = os.getenv("MOCK_MODEL_READY_FILE")
++    if not ready_file:
++        return
++
++    timeout_sec = _get_float_env("MOCK_MODEL_MOUNT_TIMEOUT_SEC", 600.0)
++    poll_interval_sec = _get_float_env("MOCK_MODEL_MOUNT_POLL_INTERVAL_SEC", 1.0)
++    deadline = time.monotonic() + timeout_sec
++
++    while not Path(ready_file).exists():
++        if time.monotonic() >= deadline:
++            raise TimeoutError(f"Timed out waiting for mock model mount ready file: {ready_file}")
++        time.sleep(poll_interval_sec)
++
++
++def get_model_path_from_manager(with_weights: bool) -> str:
++    """Return the model path expected by vllm-ascend async mount code.
++
++    Args:
++        with_weights: If False, return the metadata/bootstrap model path. If
++            True, wait for the optional ready file, then return the full model
++            path that contains weights.
++    """
++    if not with_weights:
++        meta_path = _get_required_env("MOCK_MODEL_META_PATH")
++        _validate_path(meta_path, "metadata")
++        return meta_path
++
++    _wait_until_ready()
++    weight_path = _get_required_env("MOCK_MODEL_WEIGHT_PATH")
++    _validate_path(weight_path, "weight")
++    return weight_path
+diff --git a/examples/async_model_mount/prepare_meta_only_model.py b/examples/async_model_mount/prepare_meta_only_model.py
+new file mode 100644
+index 00000000..1fcae75a
+--- /dev/null
++++ b/examples/async_model_mount/prepare_meta_only_model.py
+@@ -0,0 +1,86 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++"""Prepare a metadata-only model directory for async model mount testing."""
++
++import argparse
++import shutil
++from pathlib import Path
++
++WEIGHT_SUFFIXES = {
++    ".bin",
++    ".ckpt",
++    ".gguf",
++    ".h5",
++    ".msgpack",
++    ".pt",
++    ".pth",
++    ".safetensors",
++}
++WEIGHT_NAME_MARKERS = {
++    "model-",
++    "pytorch_model",
++    "quant_model_weights-",
++}
++
++
++def _is_weight_file(path: Path) -> bool:
++    if path.suffix in WEIGHT_SUFFIXES:
++        return True
++    return any(path.name.startswith(marker) for marker in WEIGHT_NAME_MARKERS)
++
++
++def prepare_meta_only_model(source: Path, target: Path, overwrite: bool) -> None:
++    if not source.is_dir():
++        raise NotADirectoryError(f"Source model directory does not exist: {source}")
++    if target.exists():
++        if not overwrite:
++            raise FileExistsError(f"Target already exists, pass --overwrite to replace it: {target}")
++        shutil.rmtree(target)
++
++    target.mkdir(parents=True)
++
++    for source_path in source.rglob("*"):
++        relative_path = source_path.relative_to(source)
++        target_path = target / relative_path
++
++        if source_path.is_dir():
++            target_path.mkdir(exist_ok=True)
++            continue
++
++        if _is_weight_file(source_path):
++            continue
++
++        target_path.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(source_path, target_path)
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--source", type=Path, required=True, help="Full model directory.")
++    parser.add_argument("--target", type=Path, required=True, help="Metadata-only output directory.")
++    parser.add_argument("--overwrite", action="store_true", help="Replace the target directory if it exists.")
++    return parser.parse_args()
++
++
++def main() -> None:
++    args = parse_args()
++    prepare_meta_only_model(args.source, args.target, args.overwrite)
++    print(f"Metadata-only model directory created at: {args.target}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+new file mode 100644
+index 00000000..71d4dde5
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -0,0 +1,29 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++from vllm_ascend.model_loader.rfork.rfork_loader import RForkModelLoader
++
++
++def test_ensure_rfork_worker_prefetches_fallback_path_for_existing_worker():
++    rfork_worker = MagicMock()
++    loader = RForkModelLoader.__new__(RForkModelLoader)
++    loader.load_config = SimpleNamespace(rfork_worker=rfork_worker)
++
++    assert loader._ensure_rfork_worker(SimpleNamespace()) is rfork_worker
++    rfork_worker.prefetch_fallback_model_path.assert_called_once()
+diff --git a/tests/ut/model_loader/rfork/test_rfork_worker.py b/tests/ut/model_loader/rfork/test_rfork_worker.py
+new file mode 100644
+index 00000000..c8d1a6ce
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_rfork_worker.py
+@@ -0,0 +1,79 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++import threading
++
++import pytest
++
++from vllm_ascend.model_loader.rfork.rfork_worker import RForkWorker
++
++
++def _make_worker():
++    worker = RForkWorker.__new__(RForkWorker)
++    worker.fallback_model_path = None
++    worker._fallback_path_thread = None
++    worker._fallback_path_error = None
++    worker._fallback_path_lock = threading.Lock()
++    return worker
++
++
++def test_get_fallback_model_path_resolves_without_prefetch(monkeypatch):
++    monkeypatch.setenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "1")
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.async_mount.get_model_path",
++        lambda with_weights: "/mounted/model",
++    )
++    worker = _make_worker()
++
++    assert worker.get_fallback_model_path() == "/mounted/model"
++
++
++def test_prefetch_fallback_model_path_resolves_in_background(monkeypatch):
++    monkeypatch.setenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "1")
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.async_mount.get_model_path",
++        lambda with_weights: "/mounted/model",
++    )
++    worker = _make_worker()
++
++    worker.prefetch_fallback_model_path()
++
++    assert worker.get_fallback_model_path() == "/mounted/model"
++
++
++def test_get_fallback_model_path_propagates_prefetch_error(monkeypatch):
++    monkeypatch.setenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "1")
++
++    def raise_error(with_weights):
++        raise ImportError("missing model-manager")
++
++    monkeypatch.setattr("vllm_ascend.model_loader.async_mount.get_model_path", raise_error)
++    worker = _make_worker()
++
++    worker.prefetch_fallback_model_path()
++
++    with pytest.raises(RuntimeError, match="Failed to resolve RFork fallback model path"):
++        worker.get_fallback_model_path()
++
++
++def test_prefetch_fallback_model_path_skips_when_disabled(monkeypatch):
++    monkeypatch.setenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "0")
++    worker = _make_worker()
++
++    worker.prefetch_fallback_model_path()
++
++    assert worker._fallback_path_thread is None
++    assert worker.get_fallback_model_path() is None
+diff --git a/tests/ut/model_loader/test_async_mount.py b/tests/ut/model_loader/test_async_mount.py
+new file mode 100644
+index 00000000..3d28d430
+--- /dev/null
++++ b/tests/ut/model_loader/test_async_mount.py
+@@ -0,0 +1,49 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++import pytest
++
++from vllm_ascend.model_loader import async_mount
++
++
++def test_get_model_path_returns_none_when_disabled(monkeypatch):
++    monkeypatch.setenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "0")
++
++    assert async_mount.get_model_path(with_weights=True) is None
++
++
++def test_get_model_path_uses_model_manager_when_enabled(monkeypatch):
++    monkeypatch.setenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "1")
++    monkeypatch.setattr(
++        async_mount,
++        "_get_model_manager_api",
++        lambda: lambda with_weights: "/mounted/weights" if with_weights else "/mounted/config",
++    )
++
++    assert async_mount.get_model_path(with_weights=True) == "/mounted/weights"
++    assert async_mount.get_model_path(with_weights=False) == "/mounted/config"
++
++
++def test_link_model_at_refuses_existing_non_symlink(monkeypatch, tmp_path):
++    target_path = tmp_path / "target"
++    target_path.mkdir()
++    link_path = tmp_path / "existing"
++    link_path.mkdir()
++
++    monkeypatch.setattr(async_mount, "get_model_path", lambda with_weights: str(target_path))
++
++    with pytest.raises(FileExistsError):
++        async_mount.link_model_at(str(link_path), with_weights=False)
+diff --git a/tests/ut/worker/test_worker_v1.py b/tests/ut/worker/test_worker_v1.py
+index ffd5083a..53e2e1a3 100644
+--- a/tests/ut/worker/test_worker_v1.py
++++ b/tests/ut/worker/test_worker_v1.py
+@@ -1050,6 +1050,54 @@ class TestNPUWorker(TestBase):
+             # Verify calls
+             worker.model_runner.load_model.assert_called_once()
+ 
++    @patch.dict("os.environ", {"VLLM_ASCEND_ASYNC_MODEL_MOUNT": "1"})
++    @patch("vllm_ascend.model_loader.async_mount.get_model_path")
++    def test_load_model_resolves_async_model_mount_path(self, mock_get_model_path):
++        """Test load_model resolves async mount path for non-rfork loaders"""
++        from vllm_ascend.worker.worker import NPUWorker
++
++        mock_get_model_path.return_value = "/mounted/model"
++
++        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
++            worker = NPUWorker()
++            worker.model_runner = MagicMock()
++            worker.vllm_config = MagicMock()
++            worker.vllm_config.load_config = MagicMock()
++            worker.vllm_config.load_config.load_format = "auto"
++            worker.vllm_config.model_config = MagicMock()
++            worker.vllm_config.model_config.enable_sleep_mode = False
++            worker.vllm_config.model_config.model = "/original/model"
++            worker.model_config = worker.vllm_config.model_config
++
++            worker.load_model()
++
++            mock_get_model_path.assert_called_once_with(with_weights=True)
++            self.assertEqual(worker.model_config.model, "/mounted/model")
++            worker.model_runner.load_model.assert_called_once()
++
++    @patch.dict("os.environ", {"VLLM_ASCEND_ASYNC_MODEL_MOUNT": "1"})
++    @patch("vllm_ascend.model_loader.async_mount.get_model_path")
++    def test_load_model_skips_async_model_mount_for_rfork(self, mock_get_model_path):
++        """Test load_model leaves async mount fallback to rfork loader"""
++        from vllm_ascend.worker.worker import NPUWorker
++
++        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
++            worker = NPUWorker()
++            worker.model_runner = MagicMock()
++            worker.vllm_config = MagicMock()
++            worker.vllm_config.load_config = MagicMock()
++            worker.vllm_config.load_config.load_format = "rfork"
++            worker.vllm_config.model_config = MagicMock()
++            worker.vllm_config.model_config.enable_sleep_mode = False
++            worker.vllm_config.model_config.model = "/original/model"
++            worker.model_config = worker.vllm_config.model_config
++
++            worker.load_model()
++
++            mock_get_model_path.assert_not_called()
++            self.assertEqual(worker.model_config.model, "/original/model")
++            worker.model_runner.load_model.assert_called_once()
++
+     @patch("vllm_ascend.worker.worker.CaMemAllocator")
+     def test_load_model_sleep_mode_assertion_error(self, mock_allocator_class):
+         """Test load_model method - assertion error in sleep mode"""
+diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
+index b161220e..475dc676 100644
+--- a/vllm_ascend/envs.py
++++ b/vllm_ascend/envs.py
+@@ -107,6 +107,12 @@ env_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
+         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
+     ),
++    # Whether to enable async model mount through an external model-manager service.
++    # Valid values: 0 disables this feature, 1 enables it. Default: 0.
++    # Sensitive: no.
++    "VLLM_ASCEND_ASYNC_MODEL_MOUNT": lambda: bool(
++        int(os.getenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "0"))
++    ),
+ }
+ 
+ # end-env-vars-definition
+diff --git a/vllm_ascend/model_loader/async_mount.py b/vllm_ascend/model_loader/async_mount.py
+new file mode 100644
+index 00000000..e5652ac4
+--- /dev/null
++++ b/vllm_ascend/model_loader/async_mount.py
+@@ -0,0 +1,92 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++"""Utilities for resolving model paths from an external model manager."""
++
++from collections.abc import Callable
++from functools import lru_cache
++from pathlib import Path
++
++from vllm.logger import logger
++
++import vllm_ascend.envs as envs_ascend
++
++
++@lru_cache(maxsize=1)
++def _get_model_manager_api() -> Callable[[bool], str]:
++    try:
++        from model_manager.apis import get_model_path_from_manager
++    except ImportError as exc:
++        raise ImportError(
++            "model-manager package is required when "
++            "VLLM_ASCEND_ASYNC_MODEL_MOUNT is enabled. "
++            "Install it before enabling async model mount."
++        ) from exc
++
++    return get_model_path_from_manager
++
++
++def get_model_path(with_weights: bool) -> str | None:
++    """Get a model path from model-manager when async mount is enabled."""
++    if not envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
++        return None
++
++    model_path = _get_model_manager_api()(with_weights)
++    if not model_path:
++        logger.warning(
++            "model-manager returned an empty model path, with_weights=%s",
++            with_weights,
++        )
++        return None
++
++    return model_path
++
++
++def link_model_at(link_path: str, with_weights: bool) -> str | None:
++    """Create or update a symlink to the resolved model path.
++
++    Existing non-symlink paths are never removed. This keeps async mount from
++    deleting a user-provided model directory or file when the launch path is
++    already populated.
++    """
++    model_path = get_model_path(with_weights)
++    if not model_path:
++        return None
++
++    target = Path(model_path).resolve()
++    link_name = Path(link_path)
++
++    if link_name.is_symlink():
++        if link_name.resolve() == target:
++            return str(link_name)
++        link_name.unlink()
++    elif link_name.exists():
++        if link_name.resolve() == target:
++            return str(link_name)
++        raise FileExistsError(
++            f"Cannot create async model mount symlink at {link_name}: "
++            "path already exists and is not a symlink."
++        )
++
++    link_name.parent.mkdir(parents=True, exist_ok=True)
++    link_name.symlink_to(target, target_is_directory=target.is_dir())
++    logger.info(
++        "Created async model mount symlink: %s -> %s, with_weights=%s",
++        link_name,
++        target,
++        with_weights,
++    )
++    return str(link_name)
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 8bc8305b..46f4f4a4 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -32,6 +32,7 @@ from vllm.model_executor.model_loader.utils import (
+ )
+ from vllm.utils.torch_utils import set_default_torch_dtype
+ 
++import vllm_ascend.envs as envs_ascend
+ from vllm_ascend.model_loader.rfork.rfork_worker import RForkWorker
+ 
+ 
+@@ -111,6 +112,7 @@ class RForkModelLoader(BaseModelLoader):
+             )
+             logger.info("RFork worker initialized, load_format=rfork")
+             rfork_worker = self.load_config.rfork_worker
++        rfork_worker.prefetch_fallback_model_path()
+         return rfork_worker
+ 
+     def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
+@@ -181,6 +183,21 @@ class RForkModelLoader(BaseModelLoader):
+                 self.load_config.load_format = "auto"
+                 self.load_config.model_loader_extra_config = {}
+ 
++                if envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
++                    fallback_model_path = rfork_worker.get_fallback_model_path()
++                    if fallback_model_path:
++                        model_config.model = fallback_model_path
++                        logger.info(
++                            "RFork fallback uses async mounted model path: %s",
++                            fallback_model_path,
++                        )
++                    else:
++                        logger.warning(
++                            "Async model mount is enabled but no fallback model path was resolved; "
++                            "using original model path: %s",
++                            model_config.model,
++                        )
++
+                 from vllm.model_executor.model_loader import get_model
+ 
+                 model = get_model(
+diff --git a/vllm_ascend/model_loader/rfork/rfork_worker.py b/vllm_ascend/model_loader/rfork/rfork_worker.py
+index 9cc6d14b..7cfd803d 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_worker.py
++++ b/vllm_ascend/model_loader/rfork/rfork_worker.py
+@@ -18,6 +18,7 @@ import threading
+ 
+ from vllm.logger import logger
+ 
++import vllm_ascend.envs as envs_ascend
+ from vllm_ascend.model_loader.rfork.seed_protocol import RForkSeedProtocol
+ from vllm_ascend.model_loader.rfork.seed_server import start_rfork_server
+ from vllm_ascend.model_loader.rfork.transfer_backend import (
+@@ -55,6 +56,10 @@ class RForkWorker:
+             seed_key_separator=seed_key_separator,
+             is_draft_worker=is_draft_model,
+         )
++        self.fallback_model_path: str | None = None
++        self._fallback_path_thread: threading.Thread | None = None
++        self._fallback_path_error: Exception | None = None
++        self._fallback_path_lock = threading.Lock()
+ 
+     def is_seed_available(self) -> bool:
+         self.rfork_seed = self.seed_protocol.get_seed()
+@@ -137,3 +142,51 @@ class RForkWorker:
+         self.rfork_heartbeat_thread.start()
+         logger.info("Seed service started for device_id=%s, port=%s", self.device_id, port)
+         self.seed_service_started = True
++
++    def prefetch_fallback_model_path(self) -> None:
++        """Resolve the fallback model path in the background."""
++        if not envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
++            return
++
++        with self._fallback_path_lock:
++            if self.fallback_model_path is not None:
++                return
++            if self._fallback_path_thread is not None and self._fallback_path_thread.is_alive():
++                return
++
++            self._fallback_path_error = None
++            self._fallback_path_thread = threading.Thread(
++                target=self._resolve_fallback_model_path,
++                daemon=True,
++                name="RForkFallbackPathResolver",
++            )
++            self._fallback_path_thread.start()
++
++    def _resolve_fallback_model_path(self) -> None:
++        try:
++            from vllm_ascend.model_loader.async_mount import get_model_path
++
++            self.fallback_model_path = get_model_path(with_weights=True)
++            if self.fallback_model_path:
++                logger.info("Resolved RFork fallback model path: %s", self.fallback_model_path)
++            else:
++                logger.warning("Async model mount did not return a fallback model path.")
++        except Exception as exc:
++            self._fallback_path_error = exc
++            logger.exception("Failed to resolve RFork fallback model path.")
++
++    def get_fallback_model_path(self) -> str | None:
++        """Return the fallback model path, waiting for prefetch if needed."""
++        if not envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
++            return None
++
++        thread = self._fallback_path_thread
++        if thread is None:
++            self._resolve_fallback_model_path()
++        else:
++            thread.join()
++
++        if self._fallback_path_error is not None:
++            raise RuntimeError("Failed to resolve RFork fallback model path.") from self._fallback_path_error
++
++        return self.fallback_model_path
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 5ec03c55..259ee727 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -74,6 +74,11 @@ torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFun
+ torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+ 
+ 
++def _is_rfork_load_format(load_format: object) -> bool:
++    load_format_value = getattr(load_format, "value", load_format)
++    return str(load_format_value).lower() == "rfork"
++
++
+ class NPUWorker(WorkerBase):
+     def __init__(
+         self,
+@@ -426,7 +431,32 @@ class NPUWorker(WorkerBase):
+     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
+         return self.model_runner.sample_tokens(grammar_output)
+ 
++    def _resolve_async_model_mount_path(self) -> None:
++        if not envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
++            return
++
++        load_config = getattr(self.vllm_config, "load_config", None)
++        load_format = getattr(load_config, "load_format", None)
++        if _is_rfork_load_format(load_format):
++            return
++
++        from vllm_ascend.model_loader.async_mount import get_model_path
++
++        resolved_path = get_model_path(with_weights=True)
++        if not resolved_path:
++            logger.warning(
++                "Async model mount is enabled but no model path was resolved; using original model path: %s",
++                self.model_config.model,
++            )
++            return
++
++        self.model_config.model = resolved_path
++        self.vllm_config.model_config.model = resolved_path
++        logger.info("Resolved async mounted model path: %s", resolved_path)
++
+     def load_model(self) -> None:
++        self._resolve_async_model_mount_path()
++
+         if self.vllm_config.model_config.enable_sleep_mode:
+             allocator = CaMemAllocator.get_instance()
+             assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
+-- 
+2.51.0.windows.1
+
