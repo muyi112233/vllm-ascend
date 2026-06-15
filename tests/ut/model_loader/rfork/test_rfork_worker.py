@@ -15,6 +15,7 @@
 #
 
 import threading
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -27,6 +28,7 @@ def _make_worker():
     worker._fallback_path_thread = None
     worker._fallback_path_error = None
     worker._fallback_path_lock = threading.Lock()
+    worker.seed_protocol = MagicMock()
     return worker
 
 
@@ -77,3 +79,48 @@ def test_prefetch_fallback_model_path_skips_when_disabled(monkeypatch):
 
     assert worker._fallback_path_thread is None
     assert worker.get_fallback_model_path() is None
+
+
+def test_wait_for_seed_or_fallback_model_path_returns_fallback_when_async_mount_wins(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "1")
+    monkeypatch.setattr(
+        "vllm_ascend.model_loader.async_mount.get_model_path",
+        lambda with_weights: "/mounted/model",
+    )
+    worker = _make_worker()
+    worker.seed_protocol.get_seed.return_value = None
+
+    result = worker.wait_for_seed_or_fallback_model_path(retry_interval_sec=0.01)
+
+    assert result.seed_available is False
+    assert result.fallback_model_path == "/mounted/model"
+
+
+def test_wait_for_seed_or_fallback_model_path_returns_seed_when_retry_wins(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "1")
+    async_mount_ready = threading.Event()
+
+    def wait_for_model_path(with_weights):
+        async_mount_ready.wait(timeout=1)
+        return "/mounted/model"
+
+    monkeypatch.setattr(
+        "vllm_ascend.model_loader.async_mount.get_model_path",
+        wait_for_model_path,
+    )
+    worker = _make_worker()
+    seed = {
+        "seed_ip": "127.0.0.1",
+        "seed_port": "12345",
+        "user_id": "user",
+        "seed_rank": "0",
+    }
+    worker.seed_protocol.get_seed.return_value = seed
+
+    result = worker.wait_for_seed_or_fallback_model_path(retry_interval_sec=0.01)
+    async_mount_ready.set()
+    worker._fallback_path_thread.join(timeout=1)
+
+    assert result.seed_available is True
+    assert result.fallback_model_path is None
+    assert worker.rfork_seed == seed

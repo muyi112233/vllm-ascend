@@ -112,7 +112,6 @@ class RForkModelLoader(BaseModelLoader):
             )
             logger.info("RFork worker initialized, load_format=rfork")
             rfork_worker = self.load_config.rfork_worker
-        rfork_worker.prefetch_fallback_model_path()
         return rfork_worker
 
     def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
@@ -131,10 +130,22 @@ class RForkModelLoader(BaseModelLoader):
 
         with set_default_torch_dtype(model_config.dtype):
             need_del = False
+            fallback_model_path: str | None = None
             rfork_worker = self._ensure_rfork_worker(vllm_config)
             processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
             try:
                 if not rfork_worker.is_seed_available():
+                    if envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
+                        race_result = rfork_worker.wait_for_seed_or_fallback_model_path()
+                        if race_result.seed_available:
+                            logger.info("RFork seed is available after retry, continue RFork transfer.")
+                        else:
+                            fallback_model_path = race_result.fallback_model_path
+                            raise RuntimeError("async model mount fallback is ready before RFork seed.")
+                    else:
+                        raise RuntimeError("seed is not available.")
+
+                if rfork_worker.rfork_seed is None:
                     raise RuntimeError("seed is not available.")
 
                 with target_device:
@@ -184,7 +195,7 @@ class RForkModelLoader(BaseModelLoader):
                 self.load_config.model_loader_extra_config = {}
 
                 if envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
-                    fallback_model_path = rfork_worker.get_fallback_model_path()
+                    fallback_model_path = fallback_model_path or rfork_worker.get_fallback_model_path()
                     if fallback_model_path:
                         model_config.model = fallback_model_path
                         logger.info(

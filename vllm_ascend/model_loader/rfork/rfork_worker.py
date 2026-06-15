@@ -15,6 +15,8 @@
 #
 
 import threading
+import time
+from dataclasses import dataclass
 
 from vllm.logger import logger
 
@@ -24,6 +26,14 @@ from vllm_ascend.model_loader.rfork.seed_server import start_rfork_server
 from vllm_ascend.model_loader.rfork.transfer_backend import (
     RForkTransferBackend,
 )
+
+SEED_RETRY_INTERVAL_SEC = 1.0
+
+
+@dataclass(frozen=True)
+class RForkFallbackRaceResult:
+    seed_available: bool
+    fallback_model_path: str | None = None
 
 
 class RForkWorker:
@@ -190,3 +200,45 @@ class RForkWorker:
             raise RuntimeError("Failed to resolve RFork fallback model path.") from self._fallback_path_error
 
         return self.fallback_model_path
+
+    def wait_for_seed_or_fallback_model_path(
+        self,
+        retry_interval_sec: float = SEED_RETRY_INTERVAL_SEC,
+    ) -> RForkFallbackRaceResult:
+        """Race async mount completion against repeated RFork seed lookup."""
+        if not envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
+            return RForkFallbackRaceResult(seed_available=False)
+
+        self.prefetch_fallback_model_path()
+        logger.info(
+            "Initial RFork seed lookup failed; racing seed retry with async model mount fallback."
+        )
+
+        while True:
+            if self._fallback_path_error is not None:
+                raise RuntimeError("Failed to resolve RFork fallback model path.") from self._fallback_path_error
+
+            if self.fallback_model_path:
+                logger.info("Async model mount won RFork fallback race.")
+                return RForkFallbackRaceResult(
+                    seed_available=False,
+                    fallback_model_path=self.fallback_model_path,
+                )
+
+            fallback_thread = self._fallback_path_thread
+            if fallback_thread is not None and not fallback_thread.is_alive():
+                logger.warning(
+                    "Async model mount finished without a fallback model path; "
+                    "falling back to original model path."
+                )
+                return RForkFallbackRaceResult(seed_available=False)
+
+            self.rfork_seed = self.seed_protocol.get_seed()
+            if self.rfork_seed is not None:
+                logger.info("RFork seed retry won fallback race.")
+                return RForkFallbackRaceResult(seed_available=True)
+
+            if fallback_thread is None:
+                time.sleep(retry_interval_sec)
+            else:
+                fallback_thread.join(timeout=retry_interval_sec)

@@ -20,10 +20,10 @@ from unittest.mock import MagicMock
 from vllm_ascend.model_loader.rfork.rfork_loader import RForkModelLoader
 
 
-def test_ensure_rfork_worker_prefetches_fallback_path_for_existing_worker():
+def test_ensure_rfork_worker_does_not_prefetch_fallback_path_for_existing_worker():
     rfork_worker = MagicMock()
     loader = RForkModelLoader.__new__(RForkModelLoader)
     loader.load_config = SimpleNamespace(rfork_worker=rfork_worker)
 
     assert loader._ensure_rfork_worker(SimpleNamespace()) is rfork_worker
-    rfork_worker.prefetch_fallback_model_path.assert_called_once()
+    rfork_worker.prefetch_fallback_model_path.assert_not_called()
