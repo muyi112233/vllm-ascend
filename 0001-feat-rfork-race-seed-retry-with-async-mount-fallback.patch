@@ -1,0 +1,222 @@
+From 2f276fab90b0a344d2c75fffe7c26b44e95c9c52 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Mon, 15 Jun 2026 17:12:33 +0800
+Subject: [PATCH] feat(rfork): race seed retry with async mount fallback
+
+After the first RFork seed lookup misses, concurrently wait for async model mount fallback resolution and retry seed lookup. Continue RFork transfer when a seed appears first, otherwise use the async mounted fallback path.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../model_loader/rfork/test_rfork_loader.py   |  4 +-
+ .../model_loader/rfork/test_rfork_worker.py   | 47 +++++++++++++++++
+ .../model_loader/rfork/rfork_loader.py        | 15 +++++-
+ .../model_loader/rfork/rfork_worker.py        | 52 +++++++++++++++++++
+ 4 files changed, 114 insertions(+), 4 deletions(-)
+
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+index 71d4dde5..9bb1daa7 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_loader.py
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -20,10 +20,10 @@ from unittest.mock import MagicMock
+ from vllm_ascend.model_loader.rfork.rfork_loader import RForkModelLoader
+ 
+ 
+-def test_ensure_rfork_worker_prefetches_fallback_path_for_existing_worker():
++def test_ensure_rfork_worker_does_not_prefetch_fallback_path_for_existing_worker():
+     rfork_worker = MagicMock()
+     loader = RForkModelLoader.__new__(RForkModelLoader)
+     loader.load_config = SimpleNamespace(rfork_worker=rfork_worker)
+ 
+     assert loader._ensure_rfork_worker(SimpleNamespace()) is rfork_worker
+-    rfork_worker.prefetch_fallback_model_path.assert_called_once()
++    rfork_worker.prefetch_fallback_model_path.assert_not_called()
+diff --git a/tests/ut/model_loader/rfork/test_rfork_worker.py b/tests/ut/model_loader/rfork/test_rfork_worker.py
+index c8d1a6ce..95a89c4e 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_worker.py
++++ b/tests/ut/model_loader/rfork/test_rfork_worker.py
+@@ -15,6 +15,7 @@
+ #
+ 
+ import threading
++from unittest.mock import MagicMock
+ 
+ import pytest
+ 
+@@ -27,6 +28,7 @@ def _make_worker():
+     worker._fallback_path_thread = None
+     worker._fallback_path_error = None
+     worker._fallback_path_lock = threading.Lock()
++    worker.seed_protocol = MagicMock()
+     return worker
+ 
+ 
+@@ -77,3 +79,48 @@ def test_prefetch_fallback_model_path_skips_when_disabled(monkeypatch):
+ 
+     assert worker._fallback_path_thread is None
+     assert worker.get_fallback_model_path() is None
++
++
++def test_wait_for_seed_or_fallback_model_path_returns_fallback_when_async_mount_wins(monkeypatch):
++    monkeypatch.setenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "1")
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.async_mount.get_model_path",
++        lambda with_weights: "/mounted/model",
++    )
++    worker = _make_worker()
++    worker.seed_protocol.get_seed.return_value = None
++
++    result = worker.wait_for_seed_or_fallback_model_path(retry_interval_sec=0.01)
++
++    assert result.seed_available is False
++    assert result.fallback_model_path == "/mounted/model"
++
++
++def test_wait_for_seed_or_fallback_model_path_returns_seed_when_retry_wins(monkeypatch):
++    monkeypatch.setenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "1")
++    async_mount_ready = threading.Event()
++
++    def wait_for_model_path(with_weights):
++        async_mount_ready.wait(timeout=1)
++        return "/mounted/model"
++
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.async_mount.get_model_path",
++        wait_for_model_path,
++    )
++    worker = _make_worker()
++    seed = {
++        "seed_ip": "127.0.0.1",
++        "seed_port": "12345",
++        "user_id": "user",
++        "seed_rank": "0",
++    }
++    worker.seed_protocol.get_seed.return_value = seed
++
++    result = worker.wait_for_seed_or_fallback_model_path(retry_interval_sec=0.01)
++    async_mount_ready.set()
++    worker._fallback_path_thread.join(timeout=1)
++
++    assert result.seed_available is True
++    assert result.fallback_model_path is None
++    assert worker.rfork_seed == seed
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 46f4f4a4..cfeac248 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -112,7 +112,6 @@ class RForkModelLoader(BaseModelLoader):
+             )
+             logger.info("RFork worker initialized, load_format=rfork")
+             rfork_worker = self.load_config.rfork_worker
+-        rfork_worker.prefetch_fallback_model_path()
+         return rfork_worker
+ 
+     def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
+@@ -131,10 +130,22 @@ class RForkModelLoader(BaseModelLoader):
+ 
+         with set_default_torch_dtype(model_config.dtype):
+             need_del = False
++            fallback_model_path: str | None = None
+             rfork_worker = self._ensure_rfork_worker(vllm_config)
+             processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
+             try:
+                 if not rfork_worker.is_seed_available():
++                    if envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
++                        race_result = rfork_worker.wait_for_seed_or_fallback_model_path()
++                        if race_result.seed_available:
++                            logger.info("RFork seed is available after retry, continue RFork transfer.")
++                        else:
++                            fallback_model_path = race_result.fallback_model_path
++                            raise RuntimeError("async model mount fallback is ready before RFork seed.")
++                    else:
++                        raise RuntimeError("seed is not available.")
++
++                if rfork_worker.rfork_seed is None:
+                     raise RuntimeError("seed is not available.")
+ 
+                 with target_device:
+@@ -184,7 +195,7 @@ class RForkModelLoader(BaseModelLoader):
+                 self.load_config.model_loader_extra_config = {}
+ 
+                 if envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
+-                    fallback_model_path = rfork_worker.get_fallback_model_path()
++                    fallback_model_path = fallback_model_path or rfork_worker.get_fallback_model_path()
+                     if fallback_model_path:
+                         model_config.model = fallback_model_path
+                         logger.info(
+diff --git a/vllm_ascend/model_loader/rfork/rfork_worker.py b/vllm_ascend/model_loader/rfork/rfork_worker.py
+index 7cfd803d..f7c3411c 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_worker.py
++++ b/vllm_ascend/model_loader/rfork/rfork_worker.py
+@@ -15,6 +15,8 @@
+ #
+ 
+ import threading
++import time
++from dataclasses import dataclass
+ 
+ from vllm.logger import logger
+ 
+@@ -25,6 +27,14 @@ from vllm_ascend.model_loader.rfork.transfer_backend import (
+     RForkTransferBackend,
+ )
+ 
++SEED_RETRY_INTERVAL_SEC = 1.0
++
++
++@dataclass(frozen=True)
++class RForkFallbackRaceResult:
++    seed_available: bool
++    fallback_model_path: str | None = None
++
+ 
+ class RForkWorker:
+     def __init__(
+@@ -190,3 +200,45 @@ class RForkWorker:
+             raise RuntimeError("Failed to resolve RFork fallback model path.") from self._fallback_path_error
+ 
+         return self.fallback_model_path
++
++    def wait_for_seed_or_fallback_model_path(
++        self,
++        retry_interval_sec: float = SEED_RETRY_INTERVAL_SEC,
++    ) -> RForkFallbackRaceResult:
++        """Race async mount completion against repeated RFork seed lookup."""
++        if not envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
++            return RForkFallbackRaceResult(seed_available=False)
++
++        self.prefetch_fallback_model_path()
++        logger.info(
++            "Initial RFork seed lookup failed; racing seed retry with async model mount fallback."
++        )
++
++        while True:
++            if self._fallback_path_error is not None:
++                raise RuntimeError("Failed to resolve RFork fallback model path.") from self._fallback_path_error
++
++            if self.fallback_model_path:
++                logger.info("Async model mount won RFork fallback race.")
++                return RForkFallbackRaceResult(
++                    seed_available=False,
++                    fallback_model_path=self.fallback_model_path,
++                )
++
++            fallback_thread = self._fallback_path_thread
++            if fallback_thread is not None and not fallback_thread.is_alive():
++                logger.warning(
++                    "Async model mount finished without a fallback model path; "
++                    "falling back to original model path."
++                )
++                return RForkFallbackRaceResult(seed_available=False)
++
++            self.rfork_seed = self.seed_protocol.get_seed()
++            if self.rfork_seed is not None:
++                logger.info("RFork seed retry won fallback race.")
++                return RForkFallbackRaceResult(seed_available=True)
++
++            if fallback_thread is None:
++                time.sleep(retry_interval_sec)
++            else:
++                fallback_thread.join(timeout=retry_interval_sec)
+-- 
+2.51.0.windows.1
+
