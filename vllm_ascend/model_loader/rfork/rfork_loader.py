@@ -34,6 +34,7 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_ascend.model_loader.load_timing import record_model_loader_stage_timing
 from vllm_ascend.model_loader.rfork.rfork_worker import RForkWorker
 
 
@@ -182,6 +183,7 @@ class RForkModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         prefix: str = "",
     ) -> Module | None:
+        load_model_start_time = time.time()
         device_config = vllm_config.device_config
         load_config = self.load_config
         load_device = device_config.device if load_config.device is None else load_config.device
@@ -192,9 +194,12 @@ class RForkModelLoader(BaseModelLoader):
             rfork_worker = self._ensure_rfork_worker(vllm_config, model_config)
             processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
             try:
+                seed_lookup_start_time = time.time()
                 if not rfork_worker.is_seed_available():
                     raise RuntimeError("seed is not available.")
+                seed_lookup_time = time.time() - seed_lookup_start_time
 
+                initialize_model_start_time = time.time()
                 with target_device:
                     model = initialize_model(
                         vllm_config=vllm_config,
@@ -202,10 +207,14 @@ class RForkModelLoader(BaseModelLoader):
                         prefix=prefix,
                     )
                     need_del = True
+                initialize_model_time = time.time() - initialize_model_start_time
 
+                process_weights_time = 0.0
                 if processed_layout_transfer:
                     logger.info("RFork uses post-load tensor layout transfer for quantized model.")
+                    process_weights_start_time = time.time()
                     process_weights_after_loading(model, model_config, target_device)
+                    process_weights_time += time.time() - process_weights_start_time
 
                 weight_load_start_time = time.time()
                 if not rfork_worker.pre_transfer(model):
@@ -214,15 +223,37 @@ class RForkModelLoader(BaseModelLoader):
                     raise RuntimeError("transfer failed.")
                 if not rfork_worker.post_transfer():
                     raise RuntimeError("post_transfer failed.")
+                transfer_time = time.time() - weight_load_start_time
                 logger.info(
                     "Loading model weights took %.2f seconds",
-                    time.time() - weight_load_start_time,
+                    transfer_time,
                 )
 
+                seed_service_start_time = time.time()
                 rfork_worker.start_seed_service(model)
+                seed_service_time = time.time() - seed_service_start_time
                 if not processed_layout_transfer:
+                    process_weights_start_time = time.time()
                     process_weights_after_loading(model, model_config, target_device)
+                    process_weights_time += time.time() - process_weights_start_time
 
+                logger.info(
+                    "RFork load_model total time: %.2f seconds, seed_lookup=%.2fs, "
+                    "initialize_model=%.2fs, process_weights_after_loading=%.2fs, "
+                    "transfer=%.2fs, start_seed_service=%.2fs, "
+                    "common=%.2fs, rfork_unique=%.2fs, processed_layout_transfer=%s, "
+                    "is_draft_model=%s",
+                    time.time() - load_model_start_time,
+                    seed_lookup_time,
+                    initialize_model_time,
+                    process_weights_time,
+                    transfer_time,
+                    seed_service_time,
+                    initialize_model_time + process_weights_time,
+                    seed_lookup_time + transfer_time + seed_service_time,
+                    processed_layout_transfer,
+                    getattr(rfork_worker.seed_protocol, "is_draft_worker", False),
+                )
                 return model.eval()
             except Exception as e:
                 logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", e)
@@ -243,11 +274,33 @@ class RForkModelLoader(BaseModelLoader):
                 from vllm.model_executor.model_loader import get_model
 
                 try:
-                    model = get_model(
-                        vllm_config=vllm_config,
-                        model_config=model_config,
-                        load_config=fallback_load_config,
-                        prefix=prefix,
+                    rfork_attempt_before_fallback_time = time.time() - load_model_start_time
+                    fallback_start_time = time.time()
+                    with record_model_loader_stage_timing("rfork_fallback_default") as fallback_loader_timing:
+                        model = get_model(
+                            vllm_config=vllm_config,
+                            model_config=model_config,
+                            load_config=fallback_load_config,
+                            prefix=prefix,
+                        )
+                    fallback_load_time = time.time() - fallback_start_time
+                    total_load_time = time.time() - load_model_start_time
+                    logger.info(
+                        "RFork fallback default details: get_model=%.2fs, "
+                        "default_load_weights=%.2fs/%d, process_weights_after_loading=%.2fs/%d, "
+                        "rfork_attempt_before_fallback=%.2fs, total=%.2fs",
+                        fallback_load_time,
+                        fallback_loader_timing.default_load_weights_time,
+                        fallback_loader_timing.default_load_weights_calls,
+                        fallback_loader_timing.process_weights_after_loading_time,
+                        fallback_loader_timing.process_weights_after_loading_calls,
+                        rfork_attempt_before_fallback_time,
+                        total_load_time,
+                    )
+                    logger.info(
+                        "RFork fallback default load_model time: %.2f seconds, total time: %.2f seconds",
+                        fallback_load_time,
+                        total_load_time,
                     )
                 except Exception:
                     logger.exception("RFork fallback default loader failed.")

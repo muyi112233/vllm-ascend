@@ -24,6 +24,8 @@ from torch import nn
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
 
+from vllm_ascend import envs
+
 MAX_TRANSFER_CHUNK_BYTES = 1024**3
 MAX_TRANSFER_CHUNK_WEIGHTS = 512
 
@@ -146,34 +148,162 @@ def _iter_tensors_in_value(prefix: str, value: Any, visited_object_ids: set[int]
         yield from _iter_tensors_in_value(f"{prefix}.{attr_name}", attr_value, visited_object_ids, scan_objects)
 
 
-def _iter_transferable_tensors(model: nn.Module):
+def _iter_tensors_in_public_attrs(prefix: str, value: Any):
+    if not hasattr(value, "__dict__"):
+        return
+
+    for attr_name, attr_value in vars(value).items():
+        if attr_name.startswith("_"):
+            continue
+        yield from _iter_tensors_in_value(f"{prefix}.{attr_name}", attr_value, set())
+
+
+def _try_collect_transferable_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    seen_data_ptrs: set[int],
+    collected_tensors: list[tuple[str, torch.Tensor]],
+) -> tuple[bool, bool]:
+    if not _is_transferable_tensor(tensor):
+        return False, False
+
+    data_ptr = tensor.data_ptr()
+    if data_ptr in seen_data_ptrs:
+        return False, True
+
+    seen_data_ptrs.add(data_ptr)
+    collected_tensors.append((name, tensor))
+    return True, False
+
+
+def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Tensor]]:
+    scan_start_tic = time.time()
     seen_data_ptrs: set[int] = set()
+    collected_tensors: list[tuple[str, torch.Tensor]] = []
 
+    parameter_count = 0
+    parameter_kept_count = 0
+    parameter_duplicate_count = 0
+    parameter_scan_tic = time.time()
     for name, tensor in model.named_parameters():
-        if _is_transferable_tensor(tensor) and tensor.data_ptr() not in seen_data_ptrs:
-            seen_data_ptrs.add(tensor.data_ptr())
-            yield name, tensor
+        parameter_count += 1
+        is_kept, is_duplicate = _try_collect_transferable_tensor(
+            name,
+            tensor,
+            seen_data_ptrs,
+            collected_tensors,
+        )
+        parameter_kept_count += int(is_kept)
+        parameter_duplicate_count += int(is_duplicate)
+    parameter_scan_time = time.time() - parameter_scan_tic
 
+    buffer_count = 0
+    buffer_kept_count = 0
+    buffer_duplicate_count = 0
+    buffer_scan_tic = time.time()
     for name, tensor in model.named_buffers():
-        if _is_transferable_tensor(tensor) and tensor.data_ptr() not in seen_data_ptrs:
-            seen_data_ptrs.add(tensor.data_ptr())
-            yield name, tensor
+        buffer_count += 1
+        is_kept, is_duplicate = _try_collect_transferable_tensor(
+            name,
+            tensor,
+            seen_data_ptrs,
+            collected_tensors,
+        )
+        buffer_kept_count += int(is_kept)
+        buffer_duplicate_count += int(is_duplicate)
+    buffer_scan_time = time.time() - buffer_scan_tic
 
+    module_count = 0
+    module_attr_count = 0
+    module_attr_tensor_count = 0
+    module_attr_kept_count = 0
+    module_attr_duplicate_count = 0
+    module_attr_scan_time = 0.0
+    impl_attr_count = 0
+    impl_shallow_tensor_count = 0
+    impl_kept_count = 0
+    impl_duplicate_count = 0
+    impl_shallow_scan_time = 0.0
+    impl_recursive_scan_enabled = envs.VLLM_ASCEND_RFORK_SCAN_IMPL_RECURSIVE
+    module_scan_tic = time.time()
     # Some Ascend post-load paths replace checkpoint parameters with runtime
     # tensors stored as plain module attributes, e.g. MLA/SFA W_UV and W_UK_T.
     for module_prefix, module in model.named_modules():
+        module_count += 1
         for attr_name, attr_value in vars(module).items():
             if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
                 continue
 
-            scan_objects = attr_name == "impl"
-            for tensor_name, tensor in _iter_tensors_in_value(attr_name, attr_value, set(), scan_objects):
-                if not _is_transferable_tensor(tensor) or tensor.data_ptr() in seen_data_ptrs:
-                    continue
+            attr_scan_tic = time.time()
+            if attr_name == "impl":
+                if impl_recursive_scan_enabled:
+                    attr_tensors = list(_iter_tensors_in_value(attr_name, attr_value, set(), scan_objects=True))
+                else:
+                    attr_tensors = list(_iter_tensors_in_public_attrs(attr_name, attr_value))
+            else:
+                attr_tensors = list(_iter_tensors_in_value(attr_name, attr_value, set()))
+            attr_scan_time = time.time() - attr_scan_tic
+            if attr_name == "impl":
+                impl_attr_count += 1
+                impl_shallow_tensor_count += len(attr_tensors)
+                impl_shallow_scan_time += attr_scan_time
+            else:
+                module_attr_count += 1
+                module_attr_tensor_count += len(attr_tensors)
+                module_attr_scan_time += attr_scan_time
 
-                seen_data_ptrs.add(tensor.data_ptr())
+            for tensor_name, tensor in attr_tensors:
                 full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
-                yield full_name, tensor
+                is_kept, is_duplicate = _try_collect_transferable_tensor(
+                    full_name,
+                    tensor,
+                    seen_data_ptrs,
+                    collected_tensors,
+                )
+                if attr_name == "impl":
+                    impl_kept_count += int(is_kept)
+                    impl_duplicate_count += int(is_duplicate)
+                else:
+                    module_attr_kept_count += int(is_kept)
+                    module_attr_duplicate_count += int(is_duplicate)
+    module_scan_time = time.time() - module_scan_tic
+
+    logger.info(
+        "iter_transferable_tensors details: total=%.4fs, "
+        "named_parameters=%.4fs/%d/%d/%d, named_buffers=%.4fs/%d/%d/%d, "
+        "module_loop=%.4fs, module_attrs=%.4fs/%d/%d/%d/%d, "
+        "impl_attrs=%.4fs/%d/%d/%d/%d, impl_recursive=%s, "
+        "modules=%d, tensors=%d, unique_ptrs=%d",
+        time.time() - scan_start_tic,
+        parameter_scan_time,
+        parameter_count,
+        parameter_kept_count,
+        parameter_duplicate_count,
+        buffer_scan_time,
+        buffer_count,
+        buffer_kept_count,
+        buffer_duplicate_count,
+        module_scan_time,
+        module_attr_scan_time,
+        module_attr_count,
+        module_attr_tensor_count,
+        module_attr_kept_count,
+        module_attr_duplicate_count,
+        impl_shallow_scan_time,
+        impl_attr_count,
+        impl_shallow_tensor_count,
+        impl_kept_count,
+        impl_duplicate_count,
+        impl_recursive_scan_enabled,
+        module_count,
+        len(collected_tensors),
+        len(seen_data_ptrs),
+    )
+    return collected_tensors
+
+
+def _iter_transferable_tensors(model: nn.Module):
+    yield from _collect_transferable_tensors(model)
 
 
 def _block_contains_weight_ptr(address: int, size: int, sorted_weight_ptrs: list[int]) -> bool:
@@ -270,6 +400,8 @@ class RForkTransferBackend:
         weight_mr_dict = {}
         weight_shape_dict = {}
         weight_addr_set = set()
+        weight_bytes = 0
+        collect_weights_tic = time.time()
         for name, weight in _iter_transferable_tensors(model):
             weight_mr_dict[name] = (
                 weight.data_ptr(),
@@ -278,9 +410,18 @@ class RForkTransferBackend:
             )
             weight_shape_dict[name] = tuple(weight.shape)
             weight_addr_set.add(weight.data_ptr())
-        sorted_weight_ptrs = sorted(weight_addr_set)
+            weight_bytes += weight.numel() * weight.element_size()
+        collect_weights_time = time.time() - collect_weights_tic
 
+        sort_ptrs_tic = time.time()
+        sorted_weight_ptrs = sorted(weight_addr_set)
+        sort_ptrs_time = time.time() - sort_ptrs_tic
+
+        memory_snapshot_tic = time.time()
         memory_snapshot = torch.npu.memory.memory_snapshot()
+        memory_snapshot_time = time.time() - memory_snapshot_tic
+
+        scan_snapshot_tic = time.time()
         weight_blocks_for_reg_mr = []
         for segment in memory_snapshot:
             current_weight_block = None
@@ -303,9 +444,12 @@ class RForkTransferBackend:
                         current_weight_block = (address, size)
             if current_weight_block is not None:
                 weight_blocks_for_reg_mr.append(current_weight_block)
+        scan_snapshot_time = time.time() - scan_snapshot_tic
 
         addresses, sizes = zip(*weight_blocks_for_reg_mr) if weight_blocks_for_reg_mr else ((), ())
+        batch_register_tic = time.time()
         ret = transfer_engine.batch_register_memory(addresses, sizes)
+        batch_register_time = time.time() - batch_register_tic
         if ret.is_error():
             logger.error(
                 "batch_register_memory failed for %d blocks, ret: %s",
@@ -318,6 +462,25 @@ class RForkTransferBackend:
         self.rfork_transfer_engine_weights_shape_dict = weight_shape_dict
         self.registered_weight_blocks = weight_blocks_for_reg_mr
 
+        registered_bytes = sum(sizes)
+        logger.info(
+            "register_memory_region details: collect_weights=%.4fs, "
+            "sort_ptrs=%.4fs, memory_snapshot=%.4fs, scan_snapshot=%.4fs, "
+            "batch_register=%.4fs, weights=%d, unique_ptrs=%d, "
+            "snapshot_segments=%d, registered_blocks=%d, weight_bytes=%.2f GiB, "
+            "registered_bytes=%.2f GiB",
+            collect_weights_time,
+            sort_ptrs_time,
+            memory_snapshot_time,
+            scan_snapshot_time,
+            batch_register_time,
+            len(weight_mr_dict),
+            len(weight_addr_set),
+            len(memory_snapshot),
+            len(weight_blocks_for_reg_mr),
+            weight_bytes / (1024**3),
+            registered_bytes / (1024**3),
+        )
         logger.info(
             "register_memory_region time: %.4fs, weights: %d",
             time.time() - start_reg_mr_tic,
@@ -359,15 +522,19 @@ class RForkTransferBackend:
         local_seed_key,
     ):
         transfer_engine = self._get_transfer_engine()
+        recv_start_tic = time.time()
         seed_url = f"http://{seed_instance_ip}:{seed_instance_service_port}"
+        get_remote_info_tic = time.time()
         seed_session_id, seed_weight_info, seed_weight_shapes = get_remote_instance_transfer_engine_info(
             seed_url,
             local_seed_key,
         )
+        get_remote_info_time = time.time() - get_remote_info_tic
         if seed_session_id is None or seed_weight_info is None:
             logger.error("Cannot get transfer engine session or weight info.")
             return False
 
+        prepare_metadata_tic = time.time()
         seed_ptr_list = []
         client_ptr_list = []
         client_len_list = []
@@ -410,6 +577,7 @@ class RForkTransferBackend:
             client_ptr_list.append(tensor.data_ptr())
             client_len_list.append(tensor.numel() * tensor.element_size())
             weight_names.append(name)
+        prepare_metadata_time = time.time() - prepare_metadata_tic
 
         if reshape_events:
             sample_events = ", ".join(
@@ -423,7 +591,7 @@ class RForkTransferBackend:
                 sample_events,
             )
 
-        start_transfer_tic = time.time()
+        build_chunks_tic = time.time()
         transfer_chunks = list(
             _iter_transfer_chunks(
                 weight_names,
@@ -432,11 +600,28 @@ class RForkTransferBackend:
                 client_len_list,
             )
         )
+        build_chunks_time = time.time() - build_chunks_tic
+        total_transfer_bytes = sum(client_len_list)
+        logger.info(
+            "recv_from_source prepare details: get_remote_info=%.4fs, "
+            "prepare_metadata=%.4fs, build_chunks=%.4fs, weights=%d, "
+            "seed_weights=%d, shape_info=%s, reshaped=%d, total bytes=%.2f GiB",
+            get_remote_info_time,
+            prepare_metadata_time,
+            build_chunks_time,
+            len(client_len_list),
+            len(seed_weight_info),
+            isinstance(seed_weight_shapes, dict),
+            len(reshape_events),
+            total_transfer_bytes / (1024**3),
+        )
+
+        start_transfer_tic = time.time()
         logger.info(
             "transfer weights starts, weights: %d, chunks: %d, total bytes: %.2f GiB",
             len(client_len_list),
             len(transfer_chunks),
-            sum(client_len_list) / (1024**3),
+            total_transfer_bytes / (1024**3),
         )
         for index, (chunk_names, chunk_seed_ptrs, chunk_client_ptrs, chunk_lengths) in enumerate(transfer_chunks, 1):
             chunk_start_tic = time.time()
@@ -472,28 +657,53 @@ class RForkTransferBackend:
                 time.time() - chunk_start_tic,
             )
 
-        logger.info("transfer weights time: %.4fs", time.time() - start_transfer_tic)
+        transfer_time = time.time() - start_transfer_tic
+        logger.info("transfer weights time: %.4fs", transfer_time)
+        logger.info(
+            "recv_from_source total time: %.4fs, pre_transfer_prepare=%.4fs, transfer=%.4fs",
+            time.time() - recv_start_tic,
+            start_transfer_tic - recv_start_tic,
+            transfer_time,
+        )
         return True
 
 
 def get_remote_instance_transfer_engine_info(seed_url: str, local_seed_key: str):
     try:
+        get_info_tic = time.time()
         response = requests.get(
             f"{seed_url}/get_rfork_transfer_engine_info",
             params={"seed_key": local_seed_key},
         )
+        get_info_time = time.time() - get_info_tic
         if response.status_code != 200:
             logger.error(
-                "GET %s/get_rfork_transfer_engine_info failed: %s",
+                "GET %s/get_rfork_transfer_engine_info failed: %s, time: %.4fs",
                 seed_url,
                 response.status_code,
+                get_info_time,
             )
             return None, None, None
 
+        parse_info_tic = time.time()
         data = response.json()
         info = data.get("rfork_transfer_engine_info", None)
+        parse_info_time = time.time() - parse_info_tic
         if info is not None and isinstance(info, list) and len(info) == 2:
-            return info[0], info[1], get_remote_instance_weight_shape_info(seed_url, local_seed_key)
+            get_shape_tic = time.time()
+            shape_info = get_remote_instance_weight_shape_info(seed_url, local_seed_key)
+            get_shape_time = time.time() - get_shape_tic
+            logger.info(
+                "get_remote_instance_transfer_engine_info details: "
+                "get_info=%.4fs, parse_info=%.4fs, get_shape=%.4fs, "
+                "seed_weights=%d, shape_info=%s",
+                get_info_time,
+                parse_info_time,
+                get_shape_time,
+                len(info[1]) if isinstance(info[1], dict) else -1,
+                isinstance(shape_info, dict),
+            )
+            return info[0], info[1], shape_info
 
         logger.error(
             "Failed to get rfork_transfer_engine_info in response from %s.",
@@ -507,21 +717,32 @@ def get_remote_instance_transfer_engine_info(seed_url: str, local_seed_key: str)
 
 def get_remote_instance_weight_shape_info(seed_url: str, local_seed_key: str):
     try:
+        get_shape_tic = time.time()
         response = requests.get(
             f"{seed_url}/get_rfork_transfer_engine_shape_info",
             params={"seed_key": local_seed_key},
         )
+        get_shape_time = time.time() - get_shape_tic
         if response.status_code != 200:
             logger.debug(
-                "GET %s/get_rfork_transfer_engine_shape_info failed: %s",
+                "GET %s/get_rfork_transfer_engine_shape_info failed: %s, time: %.4fs",
                 seed_url,
                 response.status_code,
+                get_shape_time,
             )
             return None
 
+        parse_shape_tic = time.time()
         data = response.json()
         info = data.get("rfork_transfer_engine_shape_info", None)
+        parse_shape_time = time.time() - parse_shape_tic
         if info is None or isinstance(info, dict):
+            logger.info(
+                "get_remote_instance_weight_shape_info details: get_shape=%.4fs, parse_shape=%.4fs, shapes=%d",
+                get_shape_time,
+                parse_shape_time,
+                len(info) if isinstance(info, dict) else 0,
+            )
             return info
 
         logger.error(
