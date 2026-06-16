@@ -114,6 +114,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Whether to enable async model mount through an external model-manager service.
+    # Valid values: 0 disables this feature, 1 enables it. Default: 0.
+    # Sensitive: no.
+    "VLLM_ASCEND_ASYNC_MODEL_MOUNT": lambda: bool(int(os.getenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "0"))),
 }
 
 # end-env-vars-definition

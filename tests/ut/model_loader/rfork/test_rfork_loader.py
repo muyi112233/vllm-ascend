@@ -157,6 +157,29 @@ def test_rfork_fallback_load_config_copy_does_not_mutate_original():
     assert load_config.model_loader_extra_config == original_extra_config
 
 
+def test_rfork_set_model_path_updates_target_config():
+    loader = RForkModelLoader(DummyLoadConfig({"model_url": "model"}))
+    model_config = SimpleNamespace(model="/models/target")
+    vllm_config = _vllm_config(model_config=model_config)
+
+    loader._set_model_path(vllm_config, model_config, "/mounted/target")
+
+    assert model_config.model == "/mounted/target"
+    assert vllm_config.model_config.model == "/mounted/target"
+
+
+def test_rfork_set_model_path_keeps_target_path_for_draft_model():
+    loader = RForkModelLoader(DummyLoadConfig({"model_url": "model"}))
+    target_model_config = SimpleNamespace(model="/models/target")
+    draft_model_config = SimpleNamespace(model="/models/draft")
+    vllm_config = _vllm_config(model_config=target_model_config)
+
+    loader._set_model_path(vllm_config, draft_model_config, "/mounted/draft")
+
+    assert draft_model_config.model == "/mounted/draft"
+    assert vllm_config.model_config.model == "/models/target"
+
+
 def test_rfork_detects_layer_sharding_config():
     assert _is_layer_sharding_enabled(
         SimpleNamespace(

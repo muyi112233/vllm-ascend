@@ -34,6 +34,7 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.model_loader.rfork.rfork_worker import RForkWorker
 
 
@@ -181,6 +182,66 @@ class RForkModelLoader(BaseModelLoader):
     def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
         return getattr(model_config, "quantization", None) is not None
 
+    def _set_model_path(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        model_path: str,
+    ) -> None:
+        model_config.model = model_path
+        if model_config is getattr(vllm_config, "model_config", None):
+            vllm_config.model_config.model = model_path
+
+    def _load_model_with_default_loader(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        prefix: str,
+        rfork_worker: RForkWorker,
+        fallback_model_path: str | None = None,
+        reset_transfer_state: bool = False,
+    ) -> Module | None:
+        fallback_load_config = _make_fallback_load_config(self.load_config)
+
+        if envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
+            fallback_model_path = fallback_model_path or rfork_worker.get_fallback_model_path()
+            if fallback_model_path:
+                self._set_model_path(vllm_config, model_config, fallback_model_path)
+                logger.info(
+                    "RFork fallback uses async mounted model path: %s",
+                    fallback_model_path,
+                )
+            else:
+                logger.warning(
+                    "Async model mount is enabled but no fallback model path was resolved; "
+                    "using original model path: %s",
+                    model_config.model,
+                )
+
+        from vllm.model_executor.model_loader import get_model
+
+        try:
+            model = get_model(
+                vllm_config=vllm_config,
+                model_config=model_config,
+                load_config=fallback_load_config,
+                prefix=prefix,
+            )
+        except Exception:
+            logger.exception("RFork fallback default loader failed.")
+            raise
+
+        try:
+            if reset_transfer_state:
+                rfork_worker.reset_transfer_state()
+            rfork_worker.start_seed_service(model)
+        except Exception as e:
+            logger.warning(
+                "Fallback model loaded, but start_seed_service failed: %s",
+                e,
+            )
+        return model
+
     def load_model(
         self,
         vllm_config: VllmConfig,
@@ -216,10 +277,35 @@ class RForkModelLoader(BaseModelLoader):
                     )
                     raise
 
+            fallback_model_path: str | None = None
+            use_default_loader = False
             rfork_worker = self._ensure_rfork_worker(vllm_config, model_config)
             processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
             try:
                 if not rfork_worker.is_seed_available():
+                    if envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
+                        race_result = rfork_worker.wait_for_seed_or_fallback_model_path()
+                        if race_result.seed_available:
+                            logger.info("RFork seed is available after retry, continue RFork transfer.")
+                        else:
+                            fallback_model_path = race_result.fallback_model_path
+                            logger.info(
+                                "RFork seed is unavailable before async model mount fallback; use default loader."
+                            )
+                            use_default_loader = True
+                    else:
+                        raise RuntimeError("seed is not available.")
+
+                if use_default_loader:
+                    return self._load_model_with_default_loader(
+                        vllm_config=vllm_config,
+                        model_config=model_config,
+                        prefix=prefix,
+                        rfork_worker=rfork_worker,
+                        fallback_model_path=fallback_model_path,
+                    )
+
+                if rfork_worker.rfork_seed is None:
                     raise RuntimeError("seed is not available.")
 
                 with target_device:
@@ -265,27 +351,11 @@ class RForkModelLoader(BaseModelLoader):
                         gc.collect()
                         torch.npu.empty_cache()
 
-                fallback_load_config = _make_fallback_load_config(self.load_config)
-
-                from vllm.model_executor.model_loader import get_model
-
-                try:
-                    model = get_model(
-                        vllm_config=vllm_config,
-                        model_config=model_config,
-                        load_config=fallback_load_config,
-                        prefix=prefix,
-                    )
-                except Exception:
-                    logger.exception("RFork fallback default loader failed.")
-                    raise
-
-                try:
-                    rfork_worker.reset_transfer_state()
-                    rfork_worker.start_seed_service(model)
-                except Exception as e:
-                    logger.warning(
-                        "Fallback model loaded, but start_seed_service failed: %s",
-                        e,
-                    )
-                return model
+                return self._load_model_with_default_loader(
+                    vllm_config=vllm_config,
+                    model_config=model_config,
+                    prefix=prefix,
+                    rfork_worker=rfork_worker,
+                    fallback_model_path=fallback_model_path,
+                    reset_transfer_state=True,
+                )

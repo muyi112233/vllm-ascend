@@ -77,6 +77,17 @@ torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFun
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
 
 
+def _is_rfork_load_format(load_format: object) -> bool:
+    for load_format_value in (
+        getattr(load_format, "value", None),
+        getattr(load_format, "name", None),
+        load_format,
+    ):
+        if load_format_value is not None and str(load_format_value).lower().split(".")[-1] == "rfork":
+            return True
+    return False
+
+
 class NPUWorker(WorkerBase):
     def __init__(
         self,
@@ -466,7 +477,32 @@ class NPUWorker(WorkerBase):
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    def _resolve_async_model_mount_path(self) -> None:
+        if not envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT:
+            return
+
+        load_config = getattr(self.vllm_config, "load_config", None)
+        load_format = getattr(load_config, "load_format", None)
+        if _is_rfork_load_format(load_format):
+            return
+
+        from vllm_ascend.model_loader.async_mount import get_model_path
+
+        resolved_path = get_model_path(with_weights=True)
+        if not resolved_path:
+            logger.warning(
+                "Async model mount is enabled but no model path was resolved; using original model path: %s",
+                self.model_config.model,
+            )
+            return
+
+        self.model_config.model = resolved_path
+        self.vllm_config.model_config.model = resolved_path
+        logger.info("Resolved async mounted model path: %s", resolved_path)
+
     def load_model(self) -> None:
+        self._resolve_async_model_mount_path()
+
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
