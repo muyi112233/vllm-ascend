@@ -2562,6 +2562,7 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_updator.warm_up_eplb()
 
     def load_model(self) -> None:
+        load_model_start_time = time.perf_counter()
         logger.info("Starting to load model %s...", self.model_config.model)
 
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
@@ -2601,6 +2602,12 @@ class NPUModelRunner(GPUModelRunner):
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
             )
+
+        load_model_total_time = time.perf_counter() - load_model_start_time
+        logger.info(
+            "Model runner load_model total time: %.2f seconds",
+            load_model_total_time,
+        )
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """

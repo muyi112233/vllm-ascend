@@ -40,6 +40,7 @@ To enable **Layer Sharding Linear**, specify the target linear layers using the 
 > **Restriction**
 > In PD-disaggregated deployments, Layer Sharding can only be enabled on the **P node** with `kv_role="kv_producer"`.
 > `kv_role="kv_consumer"` and `kv_role="kv_both"` are not supported.
+> Layer Sharding is not supported by RFork weight transfer. If `--load-format rfork` is used with `layer_sharding`, RFork transfer is bypassed and the model is loaded through the default model loader.
 
 ---
 
