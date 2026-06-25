@@ -49,6 +49,8 @@ class RForkWorker:
         seed_timeout_sec: float = 30.0,
         seed_key_separator: str = "$",
         is_draft_model: bool = False,
+        pp_rank: int | None = None,
+        ep_rank: int | None = None,
     ):
         self.device_id = device_id
         self.rfork_seed = None
@@ -65,6 +67,8 @@ class RForkWorker:
             model_deploy_strategy_name=model_deploy_strategy_name,
             seed_key_separator=seed_key_separator,
             is_draft_worker=is_draft_model,
+            pp_rank=pp_rank,
+            ep_rank=ep_rank,
         )
         self.fallback_model_path: str | None = None
         self._fallback_path_thread: threading.Thread | None = None
