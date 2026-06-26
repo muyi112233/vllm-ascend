@@ -129,19 +129,16 @@ class RForkSeedProtocol:
             seed_ip = response.headers.get("SEED_IP")
             seed_port = response.headers.get("SEED_PORT")
             user_id = response.headers.get("USER_ID")
-            seed_rank = response.headers.get("SEED_RANK")
             logger.debug(
-                "seed_ip: %s, seed_port: %s, user_id: %s, seed_rank: %s",
+                "seed_ip: %s, seed_port: %s, user_id: %s",
                 seed_ip,
                 seed_port,
                 user_id,
-                seed_rank,
             )
             return {
                 "seed_ip": seed_ip,
                 "seed_port": seed_port,
                 "user_id": user_id,
-                "seed_rank": seed_rank,
             }
 
         except RuntimeError as e:
@@ -160,21 +157,22 @@ class RForkSeedProtocol:
             user_id = seed["user_id"]
             seed_ip = seed["seed_ip"]
             seed_port = str(seed["seed_port"])
-            seed_rank = str(seed["seed_rank"])
 
-            response = requests.post(
+            response = requests.get(
                 f"{self.scheduler_url}/put_seed",
                 headers={
                     "SEED_IP": seed_ip,
                     "SEED_PORT": seed_port,
                     "USER_ID": user_id,
-                    "SEED_RANK": seed_rank,
                 },
                 timeout=self._request_timeout_sec(),
             )
 
             if response.status_code != 200:
-                raise RuntimeError(f"Failed to release seed to the planner, {response.status_code}")
+                raise RuntimeError(
+                    "Failed to release seed to the planner, "
+                    f"{response.status_code}, response={getattr(response, 'text', '')!r}"
+                )
             return True
         except RuntimeError as e:
             logger.exception("release_seed to planner RuntimeError: %s", e)
@@ -202,14 +200,12 @@ class RForkSeedProtocol:
             heartbeat_idx += 1
             result = False
             try:
-                response = requests.post(
+                response = requests.get(
                     f"{self.scheduler_url}/add_seed",
                     headers={
                         "SEED_KEY": seed_key,
                         "SEED_IP": seed_ip,
                         "SEED_PORT": str(port),
-                        "SEED_RANK": str(self.tp_rank),
-                        "SEED_REFCNT": str(0),
                     },
                     timeout=self._request_timeout_sec(),
                 )

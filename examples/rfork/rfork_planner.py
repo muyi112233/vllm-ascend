@@ -75,14 +75,13 @@ class SeedRecord:
     seed_key: str
     seed_ip: str
     seed_port: int
-    seed_rank: int
     last_heartbeat_ts: float
     resource_total: int
     resource_used: int = 0
 
     @property
     def identity(self) -> str:
-        return f"{self.seed_ip}:{self.seed_port}:{self.seed_rank}"
+        return f"{self.seed_ip}:{self.seed_port}"
 
     @property
     def available_points(self) -> int:
@@ -134,8 +133,8 @@ class Store:
         self._time = time_fn or time.time
 
     @staticmethod
-    def _seed_identity(seed_ip: str, seed_port: int, seed_rank: int) -> str:
-        return f"{seed_ip}:{seed_port}:{seed_rank}"
+    def _seed_identity(seed_ip: str, seed_port: int) -> str:
+        return f"{seed_ip}:{seed_port}"
 
     def add_seed(
         self,
@@ -143,10 +142,9 @@ class Store:
         seed_key: str,
         seed_ip: str,
         seed_port: int,
-        seed_rank: int,
         resource_total: int | None = None,
     ) -> SeedRecord:
-        identity = self._seed_identity(seed_ip, seed_port, seed_rank)
+        identity = self._seed_identity(seed_ip, seed_port)
         now = self._time()
         total = self._default_resource_points if resource_total is None else max(resource_total, 1)
 
@@ -157,7 +155,6 @@ class Store:
                     seed_key=seed_key,
                     seed_ip=seed_ip,
                     seed_port=seed_port,
-                    seed_rank=seed_rank,
                     last_heartbeat_ts=now,
                     resource_total=total,
                     resource_used=0,
@@ -198,8 +195,8 @@ class Store:
             self._leases[user_id] = lease
             return selected, lease
 
-    def put_seed(self, *, seed_ip: str, seed_port: int, seed_rank: int, user_id: str) -> bool:
-        identity = self._seed_identity(seed_ip, seed_port, seed_rank)
+    def put_seed(self, *, user_id: str, seed_ip: str, seed_port: int) -> bool:
+        identity = self._seed_identity(seed_ip, seed_port)
         with self._lock:
             lease = self._leases.get(user_id)
             if lease is None:
@@ -297,8 +294,6 @@ class AddSeedHeaders:
     seed_key: str
     seed_ip: str
     seed_port: int
-    seed_rank: int
-    seed_refcnt: int
 
 
 @dataclass(frozen=True)
@@ -308,10 +303,9 @@ class GetSeedHeaders:
 
 @dataclass(frozen=True)
 class PutSeedHeaders:
+    user_id: str
     seed_ip: str
     seed_port: int
-    seed_rank: int
-    user_id: str
 
 
 def _required(headers: Mapping[str, str], key: str) -> str:
@@ -336,8 +330,6 @@ def parse_add_seed_headers(headers: Mapping[str, str]) -> AddSeedHeaders:
         seed_key=_required(headers, "SEED_KEY"),
         seed_ip=_required(headers, "SEED_IP"),
         seed_port=_parse_int(_required(headers, "SEED_PORT"), "SEED_PORT", minimum=1),
-        seed_rank=_parse_int(_required(headers, "SEED_RANK"), "SEED_RANK", minimum=0),
-        seed_refcnt=_parse_int(_required(headers, "SEED_REFCNT"), "SEED_REFCNT", minimum=0),
     )
 
 
@@ -347,17 +339,16 @@ def parse_get_seed_headers(headers: Mapping[str, str]) -> GetSeedHeaders:
 
 def parse_put_seed_headers(headers: Mapping[str, str]) -> PutSeedHeaders:
     return PutSeedHeaders(
+        user_id=_required(headers, "USER_ID"),
         seed_ip=_required(headers, "SEED_IP"),
         seed_port=_parse_int(_required(headers, "SEED_PORT"), "SEED_PORT", minimum=1),
-        seed_rank=_parse_int(_required(headers, "SEED_RANK"), "SEED_RANK", minimum=0),
-        user_id=_required(headers, "USER_ID"),
     )
 
 
 def build_router(store: Store):
     router = APIRouter()
 
-    @router.post("/add_seed")
+    @router.get("/add_seed")
     def add_seed(request: Request) -> Response:
         try:
             parsed = parse_add_seed_headers(request.headers)
@@ -368,9 +359,6 @@ def build_router(store: Store):
             seed_key=parsed.seed_key,
             seed_ip=parsed.seed_ip,
             seed_port=parsed.seed_port,
-            seed_rank=parsed.seed_rank,
-            # vLLM currently sends SEED_REFCNT=0 as heartbeat metadata.
-            # Capacity is controlled by planner config, not by this field.
             resource_total=None,
         )
         return Response(status_code=status.HTTP_200_OK)
@@ -390,11 +378,10 @@ def build_router(store: Store):
         response = Response(status_code=status.HTTP_200_OK)
         response.headers["SEED_IP"] = seed.seed_ip
         response.headers["SEED_PORT"] = str(seed.seed_port)
-        response.headers["SEED_RANK"] = str(seed.seed_rank)
         response.headers["USER_ID"] = lease.user_id
         return response
 
-    @router.post("/put_seed")
+    @router.get("/put_seed")
     def put_seed(request: Request) -> Response:
         try:
             parsed = parse_put_seed_headers(request.headers)
@@ -402,10 +389,9 @@ def build_router(store: Store):
             return Response(content=str(err), status_code=status.HTTP_400_BAD_REQUEST)
 
         released = store.put_seed(
+            user_id=parsed.user_id,
             seed_ip=parsed.seed_ip,
             seed_port=parsed.seed_port,
-            seed_rank=parsed.seed_rank,
-            user_id=parsed.user_id,
         )
         if not released:
             return Response(content="lease not found", status_code=status.HTTP_404_NOT_FOUND)
