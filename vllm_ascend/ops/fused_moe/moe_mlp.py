@@ -18,6 +18,7 @@
 import torch
 import torch_npu
 from torch.nn.functional import pad
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
@@ -82,6 +83,31 @@ def _require_single_tensor_for_swiglu_quant(
             raise ValueError(f"{name} must be a tensor or a single-element list, but got {len(tensor_or_list)}.")
         return tensor_or_list[0]
     return tensor_or_list
+
+
+def _ensure_grouped_matmul_weight_layout(
+    weight: torch.Tensor,
+    input_hidden_size: int,
+    *,
+    name: str,
+) -> torch.Tensor:
+    if weight.dim() < 3:
+        return weight
+
+    if weight.shape[-2] == input_hidden_size:
+        return weight
+
+    if weight.shape[-1] == input_hidden_size:
+        return weight.transpose(1, 2).contiguous()
+
+    logger.warning_once(
+        "[fused_moe] %s has unexpected shape %s for input hidden size %s; "
+        "keeping the original layout.",
+        name,
+        tuple(weight.shape),
+        input_hidden_size,
+    )
+    return weight
 
 
 def quant_apply_mlp(
@@ -361,10 +387,15 @@ def unquant_apply_mlp(
     group_list_type: int = 1,
     topk_scales: torch.Tensor | None = None,
     need_trans: bool = True,
+    swiglu_limit: int = 0,
 ) -> torch.Tensor:
+    # Some MoE checkpoints already arrive in the operator-oriented layout
+    # after process_weights_after_loading(), while others still need one
+    # transpose. Infer the final layout from the hidden size so we do not
+    # double-transpose models like Qwen3-30B-A3B.
     if need_trans:
-        w1 = w1.transpose(1, 2)
-        w2 = w2.transpose(1, 2)
+        w1 = _ensure_grouped_matmul_weight_layout(w1, hidden_states.shape[-1], name="w1")
+        w2 = _ensure_grouped_matmul_weight_layout(w2, hidden_states.shape[-1], name="w2")
 
     act_name = getattr(activation, "value", activation)
 

@@ -185,21 +185,22 @@ def _collect_transferable_tensors(model: nn.Module) -> list[tuple[str, torch.Ten
         )
 
     # Some Ascend post-load paths replace checkpoint parameters with runtime
-    # tensors stored as plain module attributes, e.g. MLA/SFA W_UV and W_UK_T.
+    # tensors stored on the implementation object, e.g. MLA/SFA W_UV and
+    # W_UK_T. Keep this scan narrow so ordinary module constants like
+    # q_range/k_range/v_range are not treated as transfer weights.
     for module_prefix, module in model.named_modules():
-        for attr_name, attr_value in vars(module).items():
-            if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
-                continue
+        impl = getattr(module, "impl", None)
+        if impl is None or isinstance(impl, nn.Module):
+            continue
 
-            scan_objects = attr_name == "impl"
-            for tensor_name, tensor in _iter_tensors_in_value(attr_name, attr_value, set(), scan_objects):
-                full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
-                _try_collect_transferable_tensor(
-                    full_name,
-                    tensor,
-                    seen_data_ptrs,
-                    collected_tensors,
-                )
+        for tensor_name, tensor in _iter_tensors_in_value("impl", impl, set(), scan_objects=True):
+            full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
+            _try_collect_transferable_tensor(
+                full_name,
+                tensor,
+                seen_data_ptrs,
+                collected_tensors,
+            )
     return collected_tensors
 
 
