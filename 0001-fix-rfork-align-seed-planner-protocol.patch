@@ -1,0 +1,493 @@
+From fa19a3386aa1ddf0d6a1cefa0207c2f302cfa2f6 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Fri, 26 Jun 2026 11:14:27 +0800
+Subject: [PATCH] fix(rfork): align seed planner protocol
+
+Use the SEED_KEY-based RFork planner protocol without SEED_RANK for seed lookup and release. Align the example planner and seed protocol client around GET-based add_seed and put_seed endpoints, and add regression tests for the updated headers.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ examples/rfork/rfork_planner.py               |  36 ++---
+ .../model_loader/rfork/test_rfork_planner.py  | 134 ++++++++++++++++++
+ .../model_loader/rfork/test_seed_protocol.py  | 112 +++++++++++++++
+ .../model_loader/rfork/seed_protocol.py       |  18 +--
+ 4 files changed, 264 insertions(+), 36 deletions(-)
+ create mode 100644 tests/ut/model_loader/rfork/test_rfork_planner.py
+ create mode 100644 tests/ut/model_loader/rfork/test_seed_protocol.py
+
+diff --git a/examples/rfork/rfork_planner.py b/examples/rfork/rfork_planner.py
+index 5d920bee..f16aacc5 100644
+--- a/examples/rfork/rfork_planner.py
++++ b/examples/rfork/rfork_planner.py
+@@ -75,14 +75,13 @@ class SeedRecord:
+     seed_key: str
+     seed_ip: str
+     seed_port: int
+-    seed_rank: int
+     last_heartbeat_ts: float
+     resource_total: int
+     resource_used: int = 0
+ 
+     @property
+     def identity(self) -> str:
+-        return f"{self.seed_ip}:{self.seed_port}:{self.seed_rank}"
++        return f"{self.seed_ip}:{self.seed_port}"
+ 
+     @property
+     def available_points(self) -> int:
+@@ -134,8 +133,8 @@ class Store:
+         self._time = time_fn or time.time
+ 
+     @staticmethod
+-    def _seed_identity(seed_ip: str, seed_port: int, seed_rank: int) -> str:
+-        return f"{seed_ip}:{seed_port}:{seed_rank}"
++    def _seed_identity(seed_ip: str, seed_port: int) -> str:
++        return f"{seed_ip}:{seed_port}"
+ 
+     def add_seed(
+         self,
+@@ -143,10 +142,9 @@ class Store:
+         seed_key: str,
+         seed_ip: str,
+         seed_port: int,
+-        seed_rank: int,
+         resource_total: int | None = None,
+     ) -> SeedRecord:
+-        identity = self._seed_identity(seed_ip, seed_port, seed_rank)
++        identity = self._seed_identity(seed_ip, seed_port)
+         now = self._time()
+         total = self._default_resource_points if resource_total is None else max(resource_total, 1)
+ 
+@@ -157,7 +155,6 @@ class Store:
+                     seed_key=seed_key,
+                     seed_ip=seed_ip,
+                     seed_port=seed_port,
+-                    seed_rank=seed_rank,
+                     last_heartbeat_ts=now,
+                     resource_total=total,
+                     resource_used=0,
+@@ -198,8 +195,8 @@ class Store:
+             self._leases[user_id] = lease
+             return selected, lease
+ 
+-    def put_seed(self, *, seed_ip: str, seed_port: int, seed_rank: int, user_id: str) -> bool:
+-        identity = self._seed_identity(seed_ip, seed_port, seed_rank)
++    def put_seed(self, *, user_id: str, seed_ip: str, seed_port: int) -> bool:
++        identity = self._seed_identity(seed_ip, seed_port)
+         with self._lock:
+             lease = self._leases.get(user_id)
+             if lease is None:
+@@ -297,8 +294,6 @@ class AddSeedHeaders:
+     seed_key: str
+     seed_ip: str
+     seed_port: int
+-    seed_rank: int
+-    seed_refcnt: int
+ 
+ 
+ @dataclass(frozen=True)
+@@ -308,10 +303,9 @@ class GetSeedHeaders:
+ 
+ @dataclass(frozen=True)
+ class PutSeedHeaders:
++    user_id: str
+     seed_ip: str
+     seed_port: int
+-    seed_rank: int
+-    user_id: str
+ 
+ 
+ def _required(headers: Mapping[str, str], key: str) -> str:
+@@ -336,8 +330,6 @@ def parse_add_seed_headers(headers: Mapping[str, str]) -> AddSeedHeaders:
+         seed_key=_required(headers, "SEED_KEY"),
+         seed_ip=_required(headers, "SEED_IP"),
+         seed_port=_parse_int(_required(headers, "SEED_PORT"), "SEED_PORT", minimum=1),
+-        seed_rank=_parse_int(_required(headers, "SEED_RANK"), "SEED_RANK", minimum=0),
+-        seed_refcnt=_parse_int(_required(headers, "SEED_REFCNT"), "SEED_REFCNT", minimum=0),
+     )
+ 
+ 
+@@ -347,17 +339,16 @@ def parse_get_seed_headers(headers: Mapping[str, str]) -> GetSeedHeaders:
+ 
+ def parse_put_seed_headers(headers: Mapping[str, str]) -> PutSeedHeaders:
+     return PutSeedHeaders(
++        user_id=_required(headers, "USER_ID"),
+         seed_ip=_required(headers, "SEED_IP"),
+         seed_port=_parse_int(_required(headers, "SEED_PORT"), "SEED_PORT", minimum=1),
+-        seed_rank=_parse_int(_required(headers, "SEED_RANK"), "SEED_RANK", minimum=0),
+-        user_id=_required(headers, "USER_ID"),
+     )
+ 
+ 
+ def build_router(store: Store):
+     router = APIRouter()
+ 
+-    @router.post("/add_seed")
++    @router.get("/add_seed")
+     def add_seed(request: Request) -> Response:
+         try:
+             parsed = parse_add_seed_headers(request.headers)
+@@ -368,9 +359,6 @@ def build_router(store: Store):
+             seed_key=parsed.seed_key,
+             seed_ip=parsed.seed_ip,
+             seed_port=parsed.seed_port,
+-            seed_rank=parsed.seed_rank,
+-            # vLLM currently sends SEED_REFCNT=0 as heartbeat metadata.
+-            # Capacity is controlled by planner config, not by this field.
+             resource_total=None,
+         )
+         return Response(status_code=status.HTTP_200_OK)
+@@ -390,11 +378,10 @@ def build_router(store: Store):
+         response = Response(status_code=status.HTTP_200_OK)
+         response.headers["SEED_IP"] = seed.seed_ip
+         response.headers["SEED_PORT"] = str(seed.seed_port)
+-        response.headers["SEED_RANK"] = str(seed.seed_rank)
+         response.headers["USER_ID"] = lease.user_id
+         return response
+ 
+-    @router.post("/put_seed")
++    @router.get("/put_seed")
+     def put_seed(request: Request) -> Response:
+         try:
+             parsed = parse_put_seed_headers(request.headers)
+@@ -402,10 +389,9 @@ def build_router(store: Store):
+             return Response(content=str(err), status_code=status.HTTP_400_BAD_REQUEST)
+ 
+         released = store.put_seed(
++            user_id=parsed.user_id,
+             seed_ip=parsed.seed_ip,
+             seed_port=parsed.seed_port,
+-            seed_rank=parsed.seed_rank,
+-            user_id=parsed.user_id,
+         )
+         if not released:
+             return Response(content="lease not found", status_code=status.HTTP_404_NOT_FOUND)
+diff --git a/tests/ut/model_loader/rfork/test_rfork_planner.py b/tests/ut/model_loader/rfork/test_rfork_planner.py
+new file mode 100644
+index 00000000..688034c8
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_rfork_planner.py
+@@ -0,0 +1,134 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++import importlib.util
++import sys
++from pathlib import Path
++
++import pytest
++
++
++def _load_planner_module():
++    planner_path = Path(__file__).parents[4] / "examples" / "rfork" / "rfork_planner.py"
++    spec = importlib.util.spec_from_file_location("rfork_planner_for_test", planner_path)
++    assert spec is not None
++    assert spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++planner = _load_planner_module()
++
++
++def _make_store():
++    return planner.Store(
++        heartbeat_ttl_sec=60,
++        default_resource_points=1,
++        scheduler=planner.Scheduler(),
++        time_fn=lambda: 1.0,
++    )
++
++
++def test_parse_add_seed_headers_matches_private_protocol():
++    parsed = planner.parse_add_seed_headers(
++        {
++            "SEED_KEY": "seed-key",
++            "SEED_IP": "127.0.0.1",
++            "SEED_PORT": "8080",
++        }
++    )
++
++    assert parsed.seed_key == "seed-key"
++    assert parsed.seed_ip == "127.0.0.1"
++    assert parsed.seed_port == 8080
++    assert not hasattr(parsed, "seed_refcnt")
++    assert not hasattr(parsed, "seed_rank")
++
++
++def test_parse_put_seed_headers_matches_private_protocol():
++    parsed = planner.parse_put_seed_headers(
++        {
++            "USER_ID": "lease-id",
++            "SEED_IP": "127.0.0.1",
++            "SEED_PORT": "8080",
++        }
++    )
++
++    assert parsed.user_id == "lease-id"
++    assert parsed.seed_ip == "127.0.0.1"
++    assert parsed.seed_port == 8080
++
++
++@pytest.mark.parametrize(
++    "headers",
++    [
++        {"USER_ID": "lease-id"},
++        {"USER_ID": "lease-id", "SEED_IP": "127.0.0.1"},
++        {"USER_ID": "lease-id", "SEED_PORT": "8080"},
++    ],
++)
++def test_parse_put_seed_headers_requires_private_protocol_headers(headers):
++    with pytest.raises(planner.HeaderError):
++        planner.parse_put_seed_headers(headers)
++
++
++def test_store_moves_same_seed_endpoint_between_seed_keys():
++    store = _make_store()
++
++    store.add_seed(seed_key="key-a", seed_ip="127.0.0.1", seed_port=8080)
++    store.add_seed(seed_key="key-b", seed_ip="127.0.0.1", seed_port=8080)
++
++    assert store.debug_snapshot()["seed_count"] == 1
++
++    assert store.get_seed(seed_key="key-a") is None
++    seed_b, _ = store.get_seed(seed_key="key-b")
++
++    assert seed_b.seed_key == "key-b"
++    assert seed_b.identity == "127.0.0.1:8080"
++
++
++def test_store_put_seed_releases_by_user_id_without_seed_rank():
++    store = _make_store()
++    seed = store.add_seed(seed_key="key", seed_ip="127.0.0.1", seed_port=8080)
++    _, lease = store.get_seed(seed_key="key")
++
++    assert seed.resource_used == 1
++    assert store.put_seed(user_id=lease.user_id, seed_ip="127.0.0.1", seed_port=8080)
++    assert seed.resource_used == 0
++    assert store.debug_snapshot()["lease_count"] == 0
++
++
++def test_store_put_seed_rejects_endpoint_mismatch():
++    store = _make_store()
++    seed = store.add_seed(seed_key="key", seed_ip="127.0.0.1", seed_port=8080)
++    _, lease = store.get_seed(seed_key="key")
++
++    assert not store.put_seed(user_id=lease.user_id, seed_ip="127.0.0.2", seed_port=8080)
++    assert seed.resource_used == 1
++    assert store.debug_snapshot()["lease_count"] == 1
++
++    assert store.put_seed(user_id=lease.user_id, seed_ip="127.0.0.1", seed_port=8080)
++    assert seed.resource_used == 0
++
++
++def test_planner_update_endpoints_match_private_get_protocol():
++    app = planner.create_app(planner.Settings())
++    route_methods = {route.path: route.methods for route in app.routes if hasattr(route, "methods")}
++
++    assert route_methods["/add_seed"] == {"GET"}
++    assert route_methods["/put_seed"] == {"GET"}
+diff --git a/tests/ut/model_loader/rfork/test_seed_protocol.py b/tests/ut/model_loader/rfork/test_seed_protocol.py
+new file mode 100644
+index 00000000..75e69405
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_seed_protocol.py
+@@ -0,0 +1,112 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++from types import SimpleNamespace
++
++import pytest
++
++import vllm_ascend.model_loader.rfork.seed_protocol as seed_protocol
++from vllm_ascend.model_loader.rfork.seed_protocol import RForkSeedProtocol
++
++
++class StopHeartbeat(Exception):
++    pass
++
++
++def _make_protocol() -> RForkSeedProtocol:
++    return RForkSeedProtocol(
++        disaggregation_mode="kv_consumer",
++        node_rank=0,
++        tp_rank=1,
++        scheduler_url="http://planner",
++        model_url="/models/dsv4",
++        model_deploy_strategy_name="decode",
++    )
++
++
++def test_get_seed_does_not_require_seed_rank(monkeypatch):
++    captured = {}
++
++    def fake_get(url, headers, timeout):
++        captured.update({"url": url, "headers": headers, "timeout": timeout})
++        return SimpleNamespace(
++            status_code=200,
++            headers={
++                "SEED_IP": "127.0.0.1",
++                "SEED_PORT": "8080",
++                "USER_ID": "lease-id",
++            },
++        )
++
++    monkeypatch.setattr(seed_protocol.requests, "get", fake_get)
++
++    seed = _make_protocol().get_seed()
++
++    assert seed == {
++        "seed_ip": "127.0.0.1",
++        "seed_port": "8080",
++        "user_id": "lease-id",
++    }
++    assert captured["url"] == "http://planner/get_seed"
++    assert "SEED_KEY" in captured["headers"]
++
++
++def test_release_seed_does_not_send_seed_rank(monkeypatch):
++    captured = {}
++
++    def fake_get(url, headers, timeout):
++        captured.update({"url": url, "headers": headers, "timeout": timeout})
++        return SimpleNamespace(status_code=200, text="")
++
++    monkeypatch.setattr(seed_protocol.requests, "get", fake_get)
++
++    assert _make_protocol().release_seed(
++        {
++            "seed_ip": "127.0.0.1",
++            "seed_port": "8080",
++            "user_id": "lease-id",
++        }
++    )
++    assert captured["url"] == "http://planner/put_seed"
++    assert captured["headers"] == {
++        "SEED_IP": "127.0.0.1",
++        "SEED_PORT": "8080",
++        "USER_ID": "lease-id",
++    }
++
++
++def test_report_seed_does_not_send_seed_rank(monkeypatch):
++    captured = {}
++
++    def fake_get(url, headers, timeout):
++        captured.update({"url": url, "headers": headers, "timeout": timeout})
++        return SimpleNamespace(status_code=200, text="")
++
++    def stop_sleep(_):
++        raise StopHeartbeat()
++
++    monkeypatch.setattr(seed_protocol.requests, "get", fake_get)
++    monkeypatch.setattr(seed_protocol, "get_ip", lambda: "127.0.0.1")
++    monkeypatch.setattr(seed_protocol.time, "sleep", stop_sleep)
++
++    with pytest.raises(StopHeartbeat):
++        _make_protocol().report_seed(8080, sleep_interval=0)
++
++    assert captured["url"] == "http://planner/add_seed"
++    assert captured["headers"]["SEED_IP"] == "127.0.0.1"
++    assert captured["headers"]["SEED_PORT"] == "8080"
++    assert "SEED_REFCNT" not in captured["headers"]
++    assert "SEED_RANK" not in captured["headers"]
+diff --git a/vllm_ascend/model_loader/rfork/seed_protocol.py b/vllm_ascend/model_loader/rfork/seed_protocol.py
+index a4b4e80f..a9014c8b 100644
+--- a/vllm_ascend/model_loader/rfork/seed_protocol.py
++++ b/vllm_ascend/model_loader/rfork/seed_protocol.py
+@@ -129,19 +129,16 @@ class RForkSeedProtocol:
+             seed_ip = response.headers.get("SEED_IP")
+             seed_port = response.headers.get("SEED_PORT")
+             user_id = response.headers.get("USER_ID")
+-            seed_rank = response.headers.get("SEED_RANK")
+             logger.debug(
+-                "seed_ip: %s, seed_port: %s, user_id: %s, seed_rank: %s",
++                "seed_ip: %s, seed_port: %s, user_id: %s",
+                 seed_ip,
+                 seed_port,
+                 user_id,
+-                seed_rank,
+             )
+             return {
+                 "seed_ip": seed_ip,
+                 "seed_port": seed_port,
+                 "user_id": user_id,
+-                "seed_rank": seed_rank,
+             }
+ 
+         except RuntimeError as e:
+@@ -160,21 +157,22 @@ class RForkSeedProtocol:
+             user_id = seed["user_id"]
+             seed_ip = seed["seed_ip"]
+             seed_port = str(seed["seed_port"])
+-            seed_rank = str(seed["seed_rank"])
+ 
+-            response = requests.post(
++            response = requests.get(
+                 f"{self.scheduler_url}/put_seed",
+                 headers={
+                     "SEED_IP": seed_ip,
+                     "SEED_PORT": seed_port,
+                     "USER_ID": user_id,
+-                    "SEED_RANK": seed_rank,
+                 },
+                 timeout=self._request_timeout_sec(),
+             )
+ 
+             if response.status_code != 200:
+-                raise RuntimeError(f"Failed to release seed to the planner, {response.status_code}")
++                raise RuntimeError(
++                    "Failed to release seed to the planner, "
++                    f"{response.status_code}, response={getattr(response, 'text', '')!r}"
++                )
+             return True
+         except RuntimeError as e:
+             logger.exception("release_seed to planner RuntimeError: %s", e)
+@@ -202,14 +200,12 @@ class RForkSeedProtocol:
+             heartbeat_idx += 1
+             result = False
+             try:
+-                response = requests.post(
++                response = requests.get(
+                     f"{self.scheduler_url}/add_seed",
+                     headers={
+                         "SEED_KEY": seed_key,
+                         "SEED_IP": seed_ip,
+                         "SEED_PORT": str(port),
+-                        "SEED_RANK": str(self.tp_rank),
+-                        "SEED_REFCNT": str(0),
+                     },
+                     timeout=self._request_timeout_sec(),
+                 )
+-- 
+2.51.0.windows.1
+
