@@ -64,6 +64,145 @@ RFork does not match instances by `model_url` alone. The local seed key is compo
 This means two instances must agree on both model identity and deployment topology before the planner will treat them as interchangeable seeds.
 For deployments without pipeline or expert parallelism, the existing seed-key format is unchanged.
 
+### Planner HTTP Protocol
+
+The planner is an external HTTP service. RFork sends all planner protocol fields through HTTP headers and does not require a JSON request or response body. Header names are case-insensitive by HTTP rules, but third-party planner implementations should use the names below for compatibility.
+
+The current RFork protocol has three endpoints:
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/get_seed` | `GET` | Allocate an available seed for the receiver instance. |
+| `/add_seed` | `GET` | Register or refresh a seed service heartbeat after an instance finishes loading. |
+| `/put_seed` | `GET` | Release the seed lease after weight transfer finishes. |
+
+#### `GET /get_seed`
+
+Request headers:
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `SEED_KEY` | Yes | Seed key built from the model identity and deployment topology. |
+
+Successful response:
+
+| Status Code | Response Headers | Response Body |
+|-------------|------------------|---------------|
+| `200` | `SEED_IP`, `SEED_PORT`, `USER_ID` | Empty |
+
+Failure responses:
+
+| Status Code | Meaning |
+|-------------|---------|
+| `400` | Required headers are missing or invalid. |
+| `404` | No available seed exists for the requested `SEED_KEY`. |
+
+`USER_ID` must identify one seed lease returned by this `get_seed` allocation. The receiver sends the same `USER_ID` back to `/put_seed` when it releases the lease.
+
+#### `GET /add_seed`
+
+Request headers:
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `SEED_KEY` | Yes | Seed key served by this seed instance. |
+| `SEED_IP` | Yes | Reachable IP address of the seed service. |
+| `SEED_PORT` | Yes | Reachable port of the seed service. Must be a positive integer. |
+
+Successful response:
+
+| Status Code | Response Headers | Response Body |
+|-------------|------------------|---------------|
+| `200` | None required | Empty |
+
+Failure responses:
+
+| Status Code | Meaning |
+|-------------|---------|
+| `400` | Required headers are missing or invalid. |
+
+The planner should treat repeated `/add_seed` calls with the same `SEED_IP:SEED_PORT` as heartbeat refreshes. Each seed service endpoint should be unique.
+
+#### `GET /put_seed`
+
+Request headers:
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `USER_ID` | Yes | Lease identifier returned by `/get_seed`. |
+| `SEED_IP` | Yes | Seed IP returned by `/get_seed`. |
+| `SEED_PORT` | Yes | Seed port returned by `/get_seed`. Must be a positive integer. |
+
+Successful response:
+
+| Status Code | Response Headers | Response Body |
+|-------------|------------------|---------------|
+| `200` | None required | Empty |
+
+Failure responses:
+
+| Status Code | Meaning |
+|-------------|---------|
+| `400` | Required headers are missing or invalid. |
+| `404` | The lease does not exist or does not match the provided seed endpoint. |
+
+The current protocol does not use `SEED_RANK` or `SEED_REFCNT`. Multi-rank isolation is provided by `SEED_KEY`, which already includes the rank and deployment-topology fields described above.
+
+#### Example
+
+The following example uses `http://127.0.0.1:1223` as the planner address and `model$decode$kv_consumer$0$0` as the seed key.
+
+Register or refresh a seed service:
+
+```shell
+curl -i -X GET \
+  -H "SEED_KEY: model$decode$kv_consumer$0$0" \
+  -H "SEED_IP: 10.0.0.10" \
+  -H "SEED_PORT: 32665" \
+  http://127.0.0.1:1223/add_seed
+```
+
+Expected successful response:
+
+```http
+HTTP/1.1 200 OK
+```
+
+Request a seed for a receiver instance:
+
+```shell
+curl -i -X GET \
+  -H "SEED_KEY: model$decode$kv_consumer$0$0" \
+  http://127.0.0.1:1223/get_seed
+```
+
+Expected successful response:
+
+```http
+HTTP/1.1 200 OK
+SEED_IP: 10.0.0.10
+SEED_PORT: 32665
+USER_ID: 8f7c6d5e4b3a2910
+```
+
+Release the seed lease after transfer:
+
+```shell
+curl -i -X GET \
+  -H "USER_ID: 8f7c6d5e4b3a2910" \
+  -H "SEED_IP: 10.0.0.10" \
+  -H "SEED_PORT: 32665" \
+  http://127.0.0.1:1223/put_seed
+```
+
+Expected successful response:
+
+```http
+HTTP/1.1 200 OK
+```
+
+Use the `USER_ID` returned by `/get_seed` for the matching `/put_seed` call. Do not generate a new `USER_ID` on the receiver side.
+
 ### Quantized Models
 
 For quantized models, RFork transfers tensors after Ascend weight post-processing instead of raw checkpoint parameters. The receiver first builds the same post-load tensor layout as the seed, then RFork copies the live NPU tensors used by inference.
