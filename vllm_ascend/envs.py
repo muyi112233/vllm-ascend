@@ -110,6 +110,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Optional CSV path for Yuanrong RH2D client perf snapshots.
+    # Empty disables export. Non-sensitive. Use only for debugging/perf validation.
+    "VLLM_ASCEND_YUANRONG_PERF_DUMP_PATH": lambda: os.getenv("VLLM_ASCEND_YUANRONG_PERF_DUMP_PATH", ""),
 }
 
 # end-env-vars-definition
