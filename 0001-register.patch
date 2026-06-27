@@ -1,0 +1,217 @@
+From 865f0d5dc3310e4fb7a9b4e3eed5e1fa88ae1272 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Sat, 27 Jun 2026 16:56:38 +0800
+Subject: [PATCH] register
+
+---
+ .../ascend_store/backend/yuanrong_backend.py  | 137 +++++++++++++++++-
+ vllm_ascend/envs.py                           |   3 +
+ 2 files changed, 138 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+index 8645ac47..76eb94fc 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py
+@@ -1,5 +1,7 @@
++import csv
+ import hashlib
+ import os
++import time
+ from dataclasses import dataclass
+ from typing import Any
+ 
+@@ -10,6 +12,7 @@ from vllm.distributed.parallel_state import get_world_group
+ from vllm.logger import logger
+ from vllm.utils.network_utils import split_host_port
+ 
++from vllm_ascend import envs
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+ 
+ 
+@@ -89,6 +92,29 @@ class YuanrongHelper:
+ 
+ class YuanrongBackend(Backend):
+     _DS_MAX_BATCH_KEYS = 10000
++    _DS_PERF_CONNECT_TIMEOUT_MS = 9000
++    _DS_PERF_EXPORT_KEYS = (
++        "CLIENT_RH2D_SCATTER_BATCH",
++        "P2P_SCATTER_BATCH",
++        "RH2D_MANAGER_TRANSPORT_SCATTER_BATCH",
++        "HCCS_TRANSPORT_SCATTER_BATCH",
++        "HCCS_HIXL_REGISTER_MEM",
++        "HCCS_HIXL_TRANSFER_SYNC",
++        "HCCS_HIXL_DEREGISTER_MEM",
++    )
++    _DS_PERF_CSV_HEADER = (
++        "timestamp_ns",
++        "pid",
++        "device_id",
++        "reason",
++        "perf_key",
++        "avg_time",
++        "count",
++        "min_time",
++        "max_time",
++        "total_time",
++        "max_frequency",
++    )
+ 
+     def __init__(self, parallel_config: ParallelConfig):
+         try:
+@@ -97,6 +123,10 @@ class YuanrongBackend(Backend):
+             from yr.datasystem.object_client import WriteMode  # type: ignore[import-not-found]
+         except ImportError as exc:
+             raise ImportError("Please install openyuanrong-datasystem to use the yuanrong backend.") from exc
++        try:
++            from yr.datasystem import PerfClient  # type: ignore[attr-defined]
++        except ImportError:
++            PerfClient = None
+ 
+         self._helper = YuanrongHelper(Blob, DeviceBlobList)
+         self._ds_set_param = SetParam()
+@@ -114,6 +144,19 @@ class YuanrongBackend(Backend):
+             enable_remote_h2d=self.config.enable_remote_h2d,
+         )
+         self._hetero_client.init()
++        self._perf_client = None
++        self._perf_dump_path = envs.VLLM_ASCEND_YUANRONG_PERF_DUMP_PATH
++        if self.config.enable_remote_h2d and PerfClient is not None:
++            try:
++                self._perf_client = PerfClient(host, int(port), self._DS_PERF_CONNECT_TIMEOUT_MS, "", "")
++                self._perf_client.init()
++            except Exception as exc:
++                logger.info(
++                    "Yuanrong PerfClient is unavailable; skip client perf reset after pre-register. "
++                    "type=%s, error=%s",
++                    type(exc).__name__,
++                    exc,
++                )
+ 
+     def _ensure_device_ready(self):
+         if self._helper._device_id is None:
+@@ -126,9 +169,98 @@ class YuanrongBackend(Backend):
+         self._helper._device_id = int(torch.npu.current_device())
+ 
+     def register_buffer(self, ptrs: list[int], lengths: list[int]):
+-        # Yuanrong APIs consume device pointers directly when building blob
+-        # lists. No explicit pre-registration is required.
+         self._ensure_device_ready()
++        if not self.config.enable_remote_h2d or not ptrs:
++            return
++
++        pre_register = getattr(self._hetero_client, "pre_register_device_memory", None)
++        if pre_register is None:
++            logger.info("Yuanrong SDK does not expose device memory pre-registration; skipping register_buffer.")
++            return
++        try:
++            pre_register(ptrs, lengths)
++            logger.info("pre_register success.")
++            self._reset_client_perf_after_pre_register()
++        except RuntimeError as exc:
++            error = str(exc)
++            if "pre-registration is only supported" in error or "pre-register device memory api requires" in error:
++                logger.info("Yuanrong device memory pre-registration is unavailable; skipping. error=%s", error)
++                return
++            raise
++
++    def _reset_client_perf_after_pre_register(self):
++        perf_client = getattr(self, "_perf_client", None)
++        if perf_client is None:
++            return
++        try:
++            perf_client.reset_perf_log("client")
++            logger.info("Yuanrong client perf reset after device memory pre-register.")
++        except Exception as exc:
++            logger.info(
++                "Failed to reset Yuanrong client perf after pre-register; continuing. type=%s, error=%s",
++                type(exc).__name__,
++                exc,
++            )
++
++    def _dump_client_perf(self, reason: str):
++        perf_dump_path = getattr(self, "_perf_dump_path", "")
++        perf_client = getattr(self, "_perf_client", None)
++        if not perf_dump_path or perf_client is None:
++            return
++
++        try:
++            perf_log = perf_client.get_perf_log("client")
++        except Exception as exc:
++            logger.info(
++                "Failed to collect Yuanrong client perf. type=%s, error=%s",
++                type(exc).__name__,
++                exc,
++            )
++            return
++
++        rows = []
++        timestamp_ns = time.time_ns()
++        pid = os.getpid()
++        device_id = getattr(self._helper, "_device_id", "")
++        for perf_key in self._DS_PERF_EXPORT_KEYS:
++            detail = perf_log.get(perf_key)
++            if not detail:
++                continue
++            rows.append(
++                [
++                    timestamp_ns,
++                    pid,
++                    device_id,
++                    reason,
++                    perf_key,
++                    detail.get("avg_time", 0),
++                    detail.get("count", 0),
++                    detail.get("min_time", 0),
++                    detail.get("max_time", 0),
++                    detail.get("total_time", 0),
++                    detail.get("max_frequency", 0),
++                ]
++            )
++        if not rows:
++            return
++
++        try:
++            parent_dir = os.path.dirname(perf_dump_path)
++            if parent_dir:
++                os.makedirs(parent_dir, exist_ok=True)
++            write_header = not os.path.exists(perf_dump_path) or os.path.getsize(perf_dump_path) == 0
++            with open(perf_dump_path, "a", newline="", encoding="utf-8") as perf_file:
++                writer = csv.writer(perf_file)
++                if write_header:
++                    writer.writerow(self._DS_PERF_CSV_HEADER)
++                writer.writerows(rows)
++        except Exception as exc:
++            logger.info(
++                "Failed to write Yuanrong client perf dump. path=%s, type=%s, error=%s",
++                perf_dump_path,
++                type(exc).__name__,
++                exc,
++            )
+ 
+     def exists(self, keys: list[str]) -> list[int]:
+         if len(keys) == 0:
+@@ -181,6 +313,7 @@ class YuanrongBackend(Backend):
+                     len(keys),
+                 )
+                 logger.debug("Failed to get key details. failed_keys=%s", failed_keys)
++            self._dump_client_perf("get")
+         except Exception as exc:
+             logger.error(
+                 "Failed to get %d keys out of %d. Check network and yuanrong service.",
+diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
+index 3c8c319c..6130574e 100644
+--- a/vllm_ascend/envs.py
++++ b/vllm_ascend/envs.py
+@@ -110,6 +110,9 @@ env_variables: dict[str, Callable[[], Any]] = {
+     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
+     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
+     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
++    # Optional CSV path for Yuanrong RH2D client perf snapshots.
++    # Empty disables export. Non-sensitive. Use only for debugging/perf validation.
++    "VLLM_ASCEND_YUANRONG_PERF_DUMP_PATH": lambda: os.getenv("VLLM_ASCEND_YUANRONG_PERF_DUMP_PATH", ""),
+ }
+ 
+ # end-env-vars-definition
+-- 
+2.51.0.windows.1
+
